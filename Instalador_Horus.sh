@@ -97,7 +97,7 @@ if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce)" = "Enforcing" ]; t
     command -v apt-get >/dev/null 2>&1 && apt-get -y install policycoreutils || true
   }
   if command -v semanage >/dev/null 2>&1; then
-    semanage fcontext -a -t var_log_t "${LOG_DIR}(/.*)?" >/dev/null 2>&1 || true
+    semanage fcontext -a -t var_log_t '/var/log/horus(/.*)?' >/dev/null 2>&1 || true
     restorecon -Rv "${LOG_DIR}" || true
   fi
 fi
@@ -431,14 +431,15 @@ systemctl enable --now horus.service || true
 # ---------------------------
 # 9) Wrapper (arregla rutas de logs + uninstall fuerte)
 # ---------------------------
-cat > "${WRAPPER}" <<'WRAP'
+cat > /usr/local/bin/horus <<'WRAP'
 #!/usr/bin/env bash
 set -euo pipefail
+
 HORUS_SERVICE="horus.service"
 HORUS_DIR="/opt/horus"
 LOG_DIR="/var/log/horus"
-CERT_PEM="${HORUS_DIR}/mitmproxy-ca-cert.pem"
-CERT_CER="${HORUS_DIR}/mitmproxy-ca-cert.cer"
+CERT_PEM="${HORUS_DIR}/mitmproxy-ca-cert.pem"   # Linux/macOS/Firefox usa PEM
+CERT_CER="${HORUS_DIR}/mitmproxy-ca-cert.cer"   # Windows usa CER (DER)
 
 print_help() {
   cat <<'HHELP'
@@ -451,38 +452,38 @@ Uso:
   horus status        Muestra estado del servicio
   horus logs          Muestra últimos 200 de HTTP y SSH
   horus flows         Muestra últimos 200 de flows.csv
-  horus certpath      Imprime la ruta del certificado a distribuir
-  horus install-cert /ruta/al/mitmproxy-ca-cert.cer  Copia un .cer al dir de Horus
+  horus certpath      Muestra rutas de certificados (Windows y Linux/macOS)
+  horus install-cert /ruta/al/mitmproxy-ca-cert.cer   Copia un .cer al dir de Horus
   horus uninstall     Desinstala COMPLETAMENTE Horus (purga total)
   horus help|-h       Esta ayuda
 HHELP
 }
 
 purge_iptables() {
+  # Lee IF_IN, VPN_NET y MITM_PORT desde /opt/horus/horus.py
   local IF_IN VPN_NET MITM_PORT
-  IF_IN=$(python3 - <<PY
-import re
-cfg=open("/opt/horus/horus.py").read()
-import ast
-m=re.search(r'IF_IN\s*=\s*"([^"]+)"',cfg); print(m.group(1) if m else("tun0"))
+  IF_IN=$(python3 - <<'PY'
+import re; c=open("/opt/horus/horus.py").read()
+m=re.search(r'IF_IN\s*=\s*"([^"]+)"',c); print(m.group(1) if m else "tun0")
 PY
 )
-  VPN_NET=$(python3 - <<PY
-import re
-cfg=open("/opt/horus/horus.py").read()
-m=re.search(r'VPN_NET\s*=\s*"([^"]+)"',cfg); print(m.group(1) if m else("10.38.0.0/24"))
+  VPN_NET=$(python3 - <<'PY'
+import re; c=open("/opt/horus/horus.py").read()
+m=re.search(r'VPN_NET\s*=\s*"([^"]+)"',c); print(m.group(1) if m else "10.38.0.0/24")
 PY
 )
-  MITM_PORT=$(python3 - <<PY
-import re
-cfg=open("/opt/horus/horus.py").read()
-m=re.search(r'MITM_PORT\s*=\s*(\d+)',cfg); print(m.group(1) if m else("8080"))
+  MITM_PORT=$(python3 - <<'PY'
+import re; c=open("/opt/horus/horus.py").read()
+m=re.search(r'MITM_PORT\s*=\s*(\d+)',c); print(m.group(1) if m else "8080")
 PY
 )
-  declare -a R1=("-i" "$IF_IN" "-s" "$VPN_NET" "-p" "tcp" "--dport" "80"  "-j" "REDIRECT" "--to-ports" "$MITM_PORT")
-  declare -a R2=("-i" "$IF_IN" "-s" "$VPN_NET" "-p" "tcp" "--dport" "443" "-j" "REDIRECT" "--to-ports" "$MITM_PORT")
-  iptables -t nat -C PREROUTING "${R1[@]}" >/dev/null 2>&1 && iptables -t nat -D PREROUTING "${R1[@]}" || true
-  iptables -t nat -C PREROUTING "${R2[@]}" >/dev/null 2>&1 && iptables -t nat -D PREROUTING "${R2[@]}" || true
+
+  # Sin arrays (compatible sh/bash)
+  iptables -t nat -C PREROUTING -i "$IF_IN" -s "$VPN_NET" -p tcp --dport 80  -j REDIRECT --to-ports "$MITM_PORT" >/dev/null 2>&1 \
+    && iptables -t nat -D PREROUTING -i "$IF_IN" -s "$VPN_NET" -p tcp --dport 80  -j REDIRECT --to-ports "$MITM_PORT" || true
+
+  iptables -t nat -C PREROUTING -i "$IF_IN" -s "$VPN_NET" -p tcp --dport 443 -j REDIRECT --to-ports "$MITM_PORT" >/dev/null 2>&1 \
+    && iptables -t nat -D PREROUTING -i "$IF_IN" -s "$VPN_NET" -p tcp --dport 443 -j REDIRECT --to-ports "$MITM_PORT" || true
 }
 
 do_uninstall() {
@@ -497,7 +498,7 @@ do_uninstall() {
   pkill -f "/opt/horus/flow_sniffer.py" 2>/dev/null || true
   pkill -f "/opt/horus/horus.py" 2>/dev/null || true
 
-  echo "[*] Quitando reglas iptables..."
+  echo "[*] Quitando reglas NAT (iptables)..."
   purge_iptables
 
   echo "[*] Eliminando unit y recargando systemd..."
@@ -508,10 +509,10 @@ do_uninstall() {
   rm -rf /opt/horus /var/log/horus /root/.mitmproxy
 
   echo "[*] Eliminando wrapper/symlink y PATH..."
-  rm -f /usr/local/bin/horus /usr/bin/horus /etc/profile.d/horus_path.sh
+  rm -f /usr/local/bin/horus /usr/bin/horus /usr/local/bin/horus-uninstall /etc/profile.d/horus_path.sh
 
   if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce)" = "Enforcing" ]; then
-    command -v semanage >/dev/null 2>&1 && semanage fcontext -d /var/log/horus(/.*)? 2>/dev/null || true
+    command -v semanage >/dev/null 2>&1 && semanage fcontext -d '/var/log/horus(/.*)?' 2>/dev/null || true
     restorecon -Rv /var/log >/dev/null 2>&1 || true
   fi
 
@@ -519,18 +520,19 @@ do_uninstall() {
 }
 
 case "${1:-help}" in
-  start) systemctl start ${HORUS_SERVICE}; systemctl status ${HORUS_SERVICE} --no-pager ;;
-  stop) systemctl stop ${HORUS_SERVICE} ;;
-  restart) systemctl restart ${HORUS_SERVICE}; systemctl status ${HORUS_SERVICE} --no-pager ;;
-  status) systemctl status ${HORUS_SERVICE} --no-pager ;;
+  start)    systemctl start ${HORUS_SERVICE}; systemctl status ${HORUS_SERVICE} --no-pager ;;
+  stop)     systemctl stop ${HORUS_SERVICE} ;;
+  restart)  systemctl restart ${HORUS_SERVICE}; systemctl status ${HORUS_SERVICE} --no-pager ;;
+  status)   systemctl status ${HORUS_SERVICE} --no-pager ;;
   logs)
     echo "=== HTTP ===";  tail -n 200 "${LOG_DIR}/http_access.log" 2>/dev/null || echo "No hay http_access.log"
     echo "=== SSH  ===";  tail -n 200 "${LOG_DIR}/ssh_access.log"  2>/dev/null || echo "No hay ssh_access.log"
     ;;
-  flows)
-    tail -n 200 "${LOG_DIR}/flows.csv" 2>/dev/null || echo "No hay flows.csv"
+  flows)    tail -n 200 "${LOG_DIR}/flows.csv" 2>/dev/null || echo "No hay flows.csv" ;;
+  certpath)
+    echo "Windows (CER/DER): ${CERT_CER}"
+    echo "Linux/macOS/Firefox (PEM): ${CERT_PEM}"
     ;;
-  certpath) echo "${CERT_PEM}" ;;
   install-cert)
     if [ -z "${2:-}" ]; then echo "Uso: horus install-cert /ruta/al/mitmproxy-ca-cert.cer"; exit 2; fi
     cp "$2" "${CERT_CER}" && chmod 644 "${CERT_CER}" && echo "Cert copiado a ${CERT_CER}"
@@ -539,12 +541,12 @@ case "${1:-help}" in
   help|--help|-h|*) print_help ;;
 esac
 WRAP
-chmod 755 "${WRAPPER}"
-ln -sf "${WRAPPER}" /usr/bin/horus || true
-if ! echo "$PATH" | tr ':' '\n' | grep -q '^/usr/local/bin$'; then
-  echo 'export PATH="/usr/local/bin:$PATH"' > /etc/profile.d/horus_path.sh
-  chmod 644 /etc/profile.d/horus_path.sh
-fi
+
+# garantizar formato y permisos
+chmod +x /usr/local/bin/horus
+command -v dos2unix >/dev/null 2>&1 && dos2unix /usr/local/bin/horus || true
+ln -sf /usr/local/bin/horus /usr/bin/horus
+
 
 # desinstalador standalone
 cat > "${WRAPPER_PURGE}" <<'PURGE'
@@ -556,16 +558,16 @@ chmod 755 "${WRAPPER_PURGE}"
 # ---------------------------
 # 10) Final
 # ---------------------------
-echo
 echo "==== Instalación completada ===="
 echo " - Horus instalado en: ${HORUS_DIR}"
 echo " - Servicio systemd: horus.service"
 echo " - Wrapper: ${WRAPPER} (usa 'horus -h') y symlink /usr/bin/horus"
 echo " - Logs: ${LOG_DIR}/http_access.log, ${LOG_DIR}/ssh_access.log, ${LOG_DIR}/flows.csv"
-echo " - Cert PEM para distribuir: ${CERT_PEM_DST}"
-echo " - Cert CER (Windows DER) para distribuir: ${CERT_CER_DST}"
 echo
-echo "Instala el CERT (CER) en los clientes VPN como Trust Root CA (Windows/macOS/Firefox) y reinicia el navegador."
+echo "Certificados para distribuir a los clientes VPN:"
+echo " - Windows (formato CER/DER): ${CERT_CER_DST}"
+echo " - Linux/macOS/Firefox (formato PEM): ${CERT_PEM_DST}"
 echo
+echo "Instala el CERT correspondiente como 'Autoridad de certificación raíz de confianza' y reinicia el navegador."
 systemctl status horus --no-pager -l || true
 journalctl -u horus -n 50 --no-pager -l || true
