@@ -12,6 +12,7 @@ MITMPROXY_PY="${VENV_DIR}/bin/python"
 HORUS_SERVICE="/etc/systemd/system/horus.service"
 CERT_PEM_DST="${HORUS_DIR}/mitmproxy-ca-cert.pem"
 CERT_CER_DST="${HORUS_DIR}/mitmproxy-ca-cert.cer"
+WILDCARD_PEM_DST="${HORUS_DIR}/mitmproxy-wildcard.pem"
 WRAPPER="/usr/local/bin/horus"
 WRAPPER_PURGE="/usr/local/bin/horus-uninstall"
 MITM_CONF_DIR="/root/.mitmproxy"
@@ -207,7 +208,7 @@ IFACE = os.environ.get("HORUS_IFACE","tun0")
 os.makedirs(os.path.dirname(OUTFILE), exist_ok=True)
 open(OUTFILE,"a").close()
 def now(): return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-def is_syn(pkt): 
+def is_syn(pkt):
     try: return pkt[TCP].flags & 0x02 and not (pkt[TCP].flags & 0x10)
     except Exception: return False
 def handle(pkt):
@@ -223,23 +224,135 @@ if __name__=="__main__": main()
 PYSSHF
 chmod 755 "${HORUS_DIR}/ssh_flow_sniffer.py"
 
+MITM_CERT_ARG=""
+
 # ---------------------------
-# 5) horus.py (arranca 3 procesos + ssh flow)
+# 5) venv + paquetes
 # ---------------------------
-printf 'IF_IN = "%s"\nVPN_NET = "%s0/24"\nMITM_ADDON = "%s"\nMITM_PORT = 8080\nMITMDUMP_BIN = "%s"\nCERT_PATH = "%s"\nCERT_PATH_WIN = "%s"\nSSH_WATCHER = "%s"\nFLOW_SNIFFER = "%s"\nSSH_FLOW_SNIFFER = "%s"\nHTTP_LOG = "%s/http_access.log"\nSSH_LOG = "%s/ssh_access.log"\nFLOW_LOG = "%s/flows.csv"\n\n' \
-  "${IF_IN}" "${VPN_NET_PREFIX}" "${HORUS_DIR}/mitm_simple_logger.py" "${MITM_ENTRY}" "${CERT_PEM_DST}" "${CERT_CER_DST}" "${HORUS_DIR}/ssh_log_watcher.py" "${HORUS_DIR}/flow_sniffer.py" "${HORUS_DIR}/ssh_flow_sniffer.py" "${LOG_DIR}" "${LOG_DIR}" "${LOG_DIR}" > "${HORUS_DIR}/horus.py"
+echo "==> Creando venv en ${VENV_DIR} e instalando mitmproxy+scapy (puede tardar)..."
+python3 -m venv "${VENV_DIR}"
+"${VENV_DIR}/bin/python" -m pip install --upgrade pip setuptools wheel >/dev/null
+"${VENV_DIR}/bin/pip" install mitmproxy scapy >/dev/null || true
+
+# ---------------------------
+# 6) CA: mitmproxy bootstrap -> fallback OpenSSL
+# ---------------------------
+printf '\n'
+cat <<'__HORUS_MENU__'
+===== OPCION CA =====
+1 - Generar CA automaticamente [recomendado]
+2 - Usar CA + KEY existentes [tu entregas rutas absolutas]
+3 - Usar CERTIFICADO WILDCARD leaf para un dominio
+__HORUS_MENU__
+
+read -r -p "Selecciona 1, 2 o 3 [1]: " CA_CHOICE
+CA_CHOICE="${CA_CHOICE:-1}"
+
+mkdir -p "${MITM_CONF_DIR}"
+rm -f "${WILDCARD_PEM_DST}" || true
+if [ "${CA_CHOICE}" = "1" ]; then
+  echo "==> Intentando generar CA con mitmproxy (bootstrap forzado)..."
+  export HOME=/root LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+  rm -f "${BOOTLOG}" || true
+  if [ -x "${MITM_ENTRY}" ]; then
+    "${MITM_ENTRY}" --set confdir="${MITM_CONF_DIR}" --listen-port 0 -s /dev/null -q > "${BOOTLOG}" 2>&1 &
+  else
+    "${MITMPROXY_PY}" -m mitmproxy.tools.dump --set confdir="${MITM_CONF_DIR}" --listen-port 0 -s /dev/null -q > "${BOOTLOG}" 2>&1 &
+  fi
+  MPID=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do sleep 1; [ -f "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" ] && break; done
+  kill ${MPID} >/dev/null 2>&1 || true; wait ${MPID} 2>/dev/null || true
+  if [ -f "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" ]; then
+    cp "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" "${CERT_PEM_DST}"; chmod 644 "${CERT_PEM_DST}"
+    command -v openssl >/dev/null 2>&1 && openssl x509 -outform der -in "${CERT_PEM_DST}" -out "${CERT_CER_DST}" || true
+    chmod 644 "${CERT_CER_DST}" || true
+  else
+    echo "WARNING: mitmproxy no generó CA. Usando fallback OpenSSL..."
+    set -eux
+    openssl genrsa -out "${MITM_CONF_DIR}/mitmproxy-ca.key" 4096
+    openssl req -x509 -new -nodes -key "${MITM_CONF_DIR}/mitmproxy-ca.key" \
+      -sha256 -days 3650 \
+      -subj "/C=CO/O=Horus/OU=Monitoring/CN=Horus MITM Root CA" \
+      -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
+      -addext "keyUsage=critical,keyCertSign,cRLSign" \
+      -addext "subjectKeyIdentifier=hash" \
+      -out "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem"
+    cat "${MITM_CONF_DIR}/mitmproxy-ca.key" "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" > "${MITM_CONF_DIR}/mitmproxy-ca.pem"
+    chmod 600 "${MITM_CONF_DIR}/mitmproxy-ca.key" "${MITM_CONF_DIR}/mitmproxy-ca.pem"
+    chmod 644 "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem"
+    cp "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" "${CERT_PEM_DST}"; chmod 644 "${CERT_PEM_DST}"
+    command -v openssl >/dev/null 2>&1 && openssl x509 -outform der -in "${CERT_PEM_DST}" -out "${CERT_CER_DST}" || true
+    chmod 644 "${CERT_CER_DST}" || true
+    set +eux
+  fi
+elif [ "${CA_CHOICE}" = "2" ]; then
+  echo "==> Usar CA existente"
+  read -r -p "CERT PEM (CA o PEM combinado) [/root/my-ca.pem]: " USER_CERT
+  USER_CERT="${USER_CERT:-/root/my-ca.pem}"
+  read -r -p "KEY (si el CERT no incluye la KEY) [/root/my-ca.key]: " USER_KEY
+  USER_KEY="${USER_KEY:-}"
+  [ -f "${USER_CERT}" ] || { echo "ERROR: no existe ${USER_CERT}"; exit 1; }
+  [ -z "${USER_KEY}" ] || [ -f "${USER_KEY}" ] || { echo "ERROR: no existe ${USER_KEY}"; exit 1; }
+  if ! openssl x509 -in "${USER_CERT}" -noout -text >/tmp/_horus_cert.txt 2>/dev/null; then
+    echo "ERROR: no se pudo leer ${USER_CERT}"; exit 1
+  fi
+  grep -q "CA:TRUE" /tmp/_horus_cert.txt || { echo "ERROR: NO es una CA (wildcard de web no sirve)."; exit 1; }
+  if grep -q "PRIVATE KEY" "${USER_CERT}" 2>/dev/null; then
+    cp "${USER_CERT}" "${MITM_CONF_DIR}/mitmproxy-ca.pem"
+    awk '/-----BEGIN CERTIFICATE-----/{f=1}f{print}/-----END CERTIFICATE-----/{exit}' "${USER_CERT}" > "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" || cp "${USER_CERT}" "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem"
+  else
+    [ -n "${USER_KEY}" ] || { echo "ERROR: certificado sin KEY."; exit 1; }
+    cat "${USER_KEY}" "${USER_CERT}" > "${MITM_CONF_DIR}/mitmproxy-ca.pem"
+    cp "${USER_CERT}" "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem"
+  fi
+  chmod 600 "${MITM_CONF_DIR}/mitmproxy-ca.pem" || true
+  chmod 644 "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" || true
+  cp "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" "${CERT_PEM_DST}"; chmod 644 "${CERT_PEM_DST}"
+  command -v openssl >/dev/null 2>&1 && openssl x509 -outform der -in "${CERT_PEM_DST}" -out "${CERT_CER_DST}" || true
+  chmod 644 "${CERT_CER_DST}" || true
+else
+  echo "==> Usar certificado wildcard (*.dominio)"
+  read -r -p "Dominio wildcard (ej: *.example.com): " WILDCARD_DOMAIN
+  if [ -z "${WILDCARD_DOMAIN}" ]; then
+    echo "ERROR: dominio wildcard requerido"; exit 1
+  fi
+  read -r -p "Ruta CERT (PEM) [/root/wildcard.crt]: " WILDCARD_CERT
+  WILDCARD_CERT="${WILDCARD_CERT:-/root/wildcard.crt}"
+  read -r -p "Ruta KEY  (PEM) [/root/wildcard.key]: " WILDCARD_KEY
+  WILDCARD_KEY="${WILDCARD_KEY:-/root/wildcard.key}"
+  [ -f "${WILDCARD_CERT}" ] || { echo "ERROR: no existe ${WILDCARD_CERT}"; exit 1; }
+  [ -f "${WILDCARD_KEY}" ] || { echo "ERROR: no existe ${WILDCARD_KEY}"; exit 1; }
+  if ! openssl x509 -in "${WILDCARD_CERT}" -noout >/dev/null 2>&1; then
+    echo "ERROR: certificado inválido"; exit 1
+  fi
+  if ! openssl rsa -in "${WILDCARD_KEY}" -check -noout >/dev/null 2>&1 && ! openssl pkey -in "${WILDCARD_KEY}" -text -noout >/dev/null 2>&1; then
+    echo "ERROR: llave privada inválida"; exit 1
+  fi
+  cat "${WILDCARD_KEY}" "${WILDCARD_CERT}" > "${WILDCARD_PEM_DST}"
+  chmod 600 "${WILDCARD_PEM_DST}" || true
+  MITM_CERT_ARG="${WILDCARD_DOMAIN}=${WILDCARD_PEM_DST}"
+  cp "${WILDCARD_CERT}" "${CERT_PEM_DST}" && chmod 644 "${CERT_PEM_DST}" || true
+  command -v openssl >/dev/null 2>&1 && openssl x509 -outform der -in "${WILDCARD_CERT}" -out "${CERT_CER_DST}" || true
+  chmod 644 "${CERT_CER_DST}" || true
+fi
+
+# ---------------------------
+# 7) horus.py (arranca 3 procesos + ssh flow)
+# ---------------------------
+printf 'IF_IN = "%s"\nVPN_NET = "%s0/24"\nMITM_ADDON = "%s"\nMITM_PORT = 8080\nMITMDUMP_BIN = "%s"\nCERT_PATH = "%s"\nCERT_PATH_WIN = "%s"\nMITM_CERT = "%s"\nSSH_WATCHER = "%s"\nFLOW_SNIFFER = "%s"\nSSH_FLOW_SNIFFER = "%s"\nHTTP_LOG = "%s/http_access.log"\nSSH_LOG = "%s/ssh_access.log"\nFLOW_LOG = "%s/flows.csv"\n\n' \
+  "${IF_IN}" "${VPN_NET_PREFIX}" "${HORUS_DIR}/mitm_simple_logger.py" "${MITM_ENTRY}" "${CERT_PEM_DST}" "${CERT_CER_DST}" "${MITM_CERT_ARG}" "${HORUS_DIR}/ssh_log_watcher.py" "${HORUS_DIR}/flow_sniffer.py" "${HORUS_DIR}/ssh_flow_sniffer.py" "${LOG_DIR}" "${LOG_DIR}" "${LOG_DIR}" > "${HORUS_DIR}/horus.py"
 
 cat >> "${HORUS_DIR}/horus.py" <<'PYHORUS'
 #!/usr/bin/env python3
 import subprocess, signal, time, os, sys
 def print_banner():
     print(r"""
-  _   _   ____   _   _   ____   _____ 
+  _   _   ____   _   _   ____   _____
  | | | | / ___| | | | | / ___| | ____|
- | | | || |  _  | | | | \___ \ |  _|  
- | |_| || |_| | | |_| |  ___) || |___ 
+ | | | || |  _  | | | | \___ \ |  _|
+ | |_| || |_| | | |_| |  ___) || |___
   \___/  \____|  \___/  |____/ |_____|
-      _      ____  _   _  _____ 
+      _      ____  _   _  _____
            .--.
          .'_\/_'.
         '. /\ /.'     ,--.
@@ -249,7 +362,10 @@ def print_banner():
       /   (    )   \
 """)
     print("Horus iniciado. Cert PEM:", CERT_PATH)
-    print("Cert CER (Windows):", CERT_PATH_WIN, "\n")
+    print("Cert CER (Windows):", CERT_PATH_WIN)
+    if MITM_CERT:
+        print("Cert wildcard cargado:", MITM_CERT)
+    print()
 def check_root():
     if os.geteuid() != 0:
         print("Horus necesita ejecutarse como root."); sys.exit(1)
@@ -278,10 +394,16 @@ def del_iptables():
     try:
         if rule_exists(r2): run_cmd(["iptables","-t","nat","-D","PREROUTING"]+r2)
     except Exception as e: print("Error borrando regla 443:", e)
+def build_mitmdump_cmd(bin_path):
+    cmd=[bin_path,"--mode","transparent","--listen-port",str(MITM_PORT)]
+    if MITM_CERT:
+        cmd.extend(["--certs", MITM_CERT])
+    cmd.extend(["-s",MITM_ADDON])
+    return cmd
 def start_mitmdump():
     if os.path.exists(MITMDUMP_BIN):
-        return subprocess.Popen([MITMDUMP_BIN,"--mode","transparent","--listen-port",str(MITM_PORT),"-s",MITM_ADDON])
-    return subprocess.Popen(["mitmdump","--mode","transparent","--listen-port",str(MITM_PORT),"-s",MITM_ADDON])
+        return subprocess.Popen(build_mitmdump_cmd(MITMDUMP_BIN))
+    return subprocess.Popen(build_mitmdump_cmd("mitmdump"))
 def start_py(mod):
     vpy = os.path.join(os.path.dirname(MITMDUMP_BIN), "python")
     if os.path.exists(vpy): return subprocess.Popen([vpy, mod])
@@ -323,88 +445,6 @@ fi
 command -v dos2unix >/dev/null 2>&1 && dos2unix "${HORUS_DIR}/horus.py" || true
 chmod 755 "${HORUS_DIR}/horus.py"
 chmod 644 "${HORUS_DIR}/mitm_simple_logger.py" "${HORUS_DIR}/ssh_log_watcher.py"
-
-# ---------------------------
-# 6) venv + paquetes
-# ---------------------------
-echo "==> Creando venv en ${VENV_DIR} e instalando mitmproxy+scapy (puede tardar)..."
-python3 -m venv "${VENV_DIR}"
-"${VENV_DIR}/bin/python" -m pip install --upgrade pip setuptools wheel >/dev/null
-"${VENV_DIR}/bin/pip" install mitmproxy scapy >/dev/null || true
-
-# ---------------------------
-# 7) CA: mitmproxy bootstrap -> fallback OpenSSL
-# ---------------------------
-echo
-echo "===== OPCIÓN CA ====="
-echo "1) Generar CA automáticamente (recomendado)"
-echo "2) Usar CA + KEY existentes (tú entregas rutas absolutas)"
-read -r -p "Selecciona 1 o 2 [1]: " CA_CHOICE
-CA_CHOICE="${CA_CHOICE:-1}"
-
-mkdir -p "${MITM_CONF_DIR}"
-if [ "${CA_CHOICE}" = "1" ]; then
-  echo "==> Intentando generar CA con mitmproxy (bootstrap forzado)..."
-  export HOME=/root LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
-  rm -f "${BOOTLOG}" || true
-  if [ -x "${MITM_ENTRY}" ]; then
-    "${MITM_ENTRY}" --set confdir="${MITM_CONF_DIR}" --listen-port 0 -s /dev/null -q > "${BOOTLOG}" 2>&1 &
-  else
-    "${MITMPROXY_PY}" -m mitmproxy.tools.dump --set confdir="${MITM_CONF_DIR}" --listen-port 0 -s /dev/null -q > "${BOOTLOG}" 2>&1 &
-  fi
-  MPID=$!
-  for _ in {1..10}; do sleep 1; [ -f "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" ] && break; done
-  kill ${MPID} >/dev/null 2>&1 || true; wait ${MPID} 2>/dev/null || true
-  if [ -f "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" ]; then
-    cp "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" "${CERT_PEM_DST}"; chmod 644 "${CERT_PEM_DST}"
-    command -v openssl >/dev/null 2>&1 && openssl x509 -outform der -in "${CERT_PEM_DST}" -out "${CERT_CER_DST}" || true
-    chmod 644 "${CERT_CER_DST}" || true
-  else
-    echo "WARNING: mitmproxy no generó CA. Usando fallback OpenSSL..."
-    set -eux
-    openssl genrsa -out "${MITM_CONF_DIR}/mitmproxy-ca.key" 4096
-    openssl req -x509 -new -nodes -key "${MITM_CONF_DIR}/mitmproxy-ca.key" \
-      -sha256 -days 3650 \
-      -subj "/C=CO/O=Horus/OU=Monitoring/CN=Horus MITM Root CA" \
-      -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
-      -addext "keyUsage=critical,keyCertSign,cRLSign" \
-      -addext "subjectKeyIdentifier=hash" \
-      -addext "authorityKeyIdentifier=keyid:always,issuer:always" \
-      -out "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem"
-    cat "${MITM_CONF_DIR}/mitmproxy-ca.key" "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" > "${MITM_CONF_DIR}/mitmproxy-ca.pem"
-    chmod 600 "${MITM_CONF_DIR}/mitmproxy-ca.key" "${MITM_CONF_DIR}/mitmproxy-ca.pem"
-    chmod 644 "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem"
-    cp "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" "${CERT_PEM_DST}"; chmod 644 "${CERT_PEM_DST}"
-    command -v openssl >/dev/null 2>&1 && openssl x509 -outform der -in "${CERT_PEM_DST}" -out "${CERT_CER_DST}" || true
-    chmod 644 "${CERT_CER_DST}" || true
-    set +eux
-  fi
-else
-  echo "==> Usar CA existente"
-  read -r -p "CERT PEM (CA o PEM combinado) [/root/my-ca.pem]: " USER_CERT
-  USER_CERT="${USER_CERT:-/root/my-ca.pem}"
-  read -r -p "KEY (si el CERT no incluye la KEY) [/root/my-ca.key]: " USER_KEY
-  USER_KEY="${USER_KEY:-}"
-  [ -f "${USER_CERT}" ] || { echo "ERROR: no existe ${USER_CERT}"; exit 1; }
-  [ -z "${USER_KEY}" ] || [ -f "${USER_KEY}" ] || { echo "ERROR: no existe ${USER_KEY}"; exit 1; }
-  if ! openssl x509 -in "${USER_CERT}" -noout -text >/tmp/_horus_cert.txt 2>/dev/null; then
-    echo "ERROR: no se pudo leer ${USER_CERT}"; exit 1
-  fi
-  grep -q "CA:TRUE" /tmp/_horus_cert.txt || { echo "ERROR: NO es una CA (wildcard de web no sirve)."; exit 1; }
-  if grep -q "PRIVATE KEY" "${USER_CERT}" 2>/dev/null; then
-    cp "${USER_CERT}" "${MITM_CONF_DIR}/mitmproxy-ca.pem"
-    awk '/-----BEGIN CERTIFICATE-----/{f=1}f{print}/-----END CERTIFICATE-----/{exit}' "${USER_CERT}" > "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" || cp "${USER_CERT}" "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem"
-  else
-    [ -n "${USER_KEY}" ] || { echo "ERROR: certificado sin KEY."; exit 1; }
-    cat "${USER_KEY}" "${USER_CERT}" > "${MITM_CONF_DIR}/mitmproxy-ca.pem"
-    cp "${USER_CERT}" "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem"
-  fi
-  chmod 600 "${MITM_CONF_DIR}/mitmproxy-ca.pem" || true
-  chmod 644 "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" || true
-  cp "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" "${CERT_PEM_DST}"; chmod 644 "${CERT_PEM_DST}"
-  command -v openssl >/dev/null 2>&1 && openssl x509 -outform der -in "${CERT_PEM_DST}" -out "${CERT_CER_DST}" || true
-  chmod 644 "${CERT_CER_DST}" || true
-fi
 
 # ---------------------------
 # 8) systemd unit y arranque
