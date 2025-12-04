@@ -239,116 +239,6 @@ python3 -m venv "${VENV_DIR}"
 # ---------------------------
 # 6) CA: mitmproxy bootstrap -> fallback OpenSSL
 # ---------------------------
-printf '\n'
-cat <<'__HORUS_MENU__'
-===== OPCION CA =====
-1 - Generar CA automaticamente [recomendado]
-2 - Usar CA + KEY existentes [tu entregas rutas absolutas]
-3 - Usar CERTIFICADO WILDCARD leaf para un dominio
-__HORUS_MENU__
-
-read -r -p "Selecciona 1, 2 o 3 [1]: " CA_CHOICE
-CA_CHOICE="${CA_CHOICE:-1}"
-
-mkdir -p "${MITM_CONF_DIR}"
-rm -f "${WILDCARD_PEM_DST}" || true
-if [ "${CA_CHOICE}" = "1" ]; then
-  echo "==> Intentando generar CA con mitmproxy (bootstrap forzado)..."
-  export HOME=/root LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
-  rm -f "${BOOTLOG}" || true
-  if [ -x "${MITM_ENTRY}" ]; then
-    "${MITM_ENTRY}" --set confdir="${MITM_CONF_DIR}" --listen-port 0 -s /dev/null -q > "${BOOTLOG}" 2>&1 &
-  else
-    "${MITMPROXY_PY}" -m mitmproxy.tools.dump --set confdir="${MITM_CONF_DIR}" --listen-port 0 -s /dev/null -q > "${BOOTLOG}" 2>&1 &
-  fi
-  MPID=$!
-  for _ in 1 2 3 4 5 6 7 8 9 10; do sleep 1; [ -f "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" ] && break; done
-  kill ${MPID} >/dev/null 2>&1 || true; wait ${MPID} 2>/dev/null || true
-  if [ -f "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" ]; then
-    cp "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" "${CERT_PEM_DST}"; chmod 644 "${CERT_PEM_DST}"
-    command -v openssl >/dev/null 2>&1 && openssl x509 -outform der -in "${CERT_PEM_DST}" -out "${CERT_CER_DST}" || true
-    chmod 644 "${CERT_CER_DST}" || true
-  else
-    echo "WARNING: mitmproxy no generó CA. Usando fallback OpenSSL..."
-    set -eux
-    openssl genrsa -out "${MITM_CONF_DIR}/mitmproxy-ca.key" 4096
-    openssl req -x509 -new -nodes -key "${MITM_CONF_DIR}/mitmproxy-ca.key" \
-      -sha256 -days 3650 \
-      -subj "/C=CO/O=Horus/OU=Monitoring/CN=Horus MITM Root CA" \
-      -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
-      -addext "keyUsage=critical,keyCertSign,cRLSign" \
-      -addext "subjectKeyIdentifier=hash" \
-      -out "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem"
-    cat "${MITM_CONF_DIR}/mitmproxy-ca.key" "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" > "${MITM_CONF_DIR}/mitmproxy-ca.pem"
-    chmod 600 "${MITM_CONF_DIR}/mitmproxy-ca.key" "${MITM_CONF_DIR}/mitmproxy-ca.pem"
-    chmod 644 "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem"
-    cp "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" "${CERT_PEM_DST}"; chmod 644 "${CERT_PEM_DST}"
-    command -v openssl >/dev/null 2>&1 && openssl x509 -outform der -in "${CERT_PEM_DST}" -out "${CERT_CER_DST}" || true
-    chmod 644 "${CERT_CER_DST}" || true
-    set +eux
-  fi
-elif [ "${CA_CHOICE}" = "2" ]; then
-  echo "==> Usar CA existente"
-  read -r -p "CERT PEM (CA o PEM combinado) [/root/my-ca.pem]: " USER_CERT
-  USER_CERT="${USER_CERT:-/root/my-ca.pem}"
-  read -r -p "KEY (si el CERT no incluye la KEY) [/root/my-ca.key]: " USER_KEY
-  USER_KEY="${USER_KEY:-}"
-  [ -f "${USER_CERT}" ] || { echo "ERROR: no existe ${USER_CERT}"; exit 1; }
-  [ -z "${USER_KEY}" ] || [ -f "${USER_KEY}" ] || { echo "ERROR: no existe ${USER_KEY}"; exit 1; }
-  if ! openssl x509 -in "${USER_CERT}" -noout -text >/tmp/_horus_cert.txt 2>/dev/null; then
-    echo "ERROR: no se pudo leer ${USER_CERT}"; exit 1
-  fi
-  grep -q "CA:TRUE" /tmp/_horus_cert.txt || { echo "ERROR: NO es una CA (wildcard de web no sirve)."; exit 1; }
-  if grep -q "PRIVATE KEY" "${USER_CERT}" 2>/dev/null; then
-    cp "${USER_CERT}" "${MITM_CONF_DIR}/mitmproxy-ca.pem"
-    awk '/-----BEGIN CERTIFICATE-----/{f=1}f{print}/-----END CERTIFICATE-----/{exit}' "${USER_CERT}" > "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" || cp "${USER_CERT}" "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem"
-  else
-    [ -n "${USER_KEY}" ] || { echo "ERROR: certificado sin KEY."; exit 1; }
-    cat "${USER_KEY}" "${USER_CERT}" > "${MITM_CONF_DIR}/mitmproxy-ca.pem"
-    cp "${USER_CERT}" "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem"
-  fi
-  chmod 600 "${MITM_CONF_DIR}/mitmproxy-ca.pem" || true
-  chmod 644 "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" || true
-  cp "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" "${CERT_PEM_DST}"; chmod 644 "${CERT_PEM_DST}"
-  command -v openssl >/dev/null 2>&1 && openssl x509 -outform der -in "${CERT_PEM_DST}" -out "${CERT_CER_DST}" || true
-  chmod 644 "${CERT_CER_DST}" || true
-else
-  echo "==> Usar certificado wildcard (*.dominio)"
-  read -r -p "Dominio wildcard (ej: *.example.com): " WILDCARD_DOMAIN
-  if [ -z "${WILDCARD_DOMAIN}" ]; then
-    echo "ERROR: dominio wildcard requerido"; exit 1
-  fi
-  read -r -p "Ruta CERT (PEM) [/root/wildcard.crt]: " WILDCARD_CERT
-  WILDCARD_CERT="${WILDCARD_CERT:-/root/wildcard.crt}"
-  read -r -p "Ruta KEY  (PEM) [/root/wildcard.key]: " WILDCARD_KEY
-  WILDCARD_KEY="${WILDCARD_KEY:-/root/wildcard.key}"
-  [ -f "${WILDCARD_CERT}" ] || { echo "ERROR: no existe ${WILDCARD_CERT}"; exit 1; }
-  [ -f "${WILDCARD_KEY}" ] || { echo "ERROR: no existe ${WILDCARD_KEY}"; exit 1; }
-  if ! openssl x509 -in "${WILDCARD_CERT}" -noout >/dev/null 2>&1; then
-    echo "ERROR: certificado inválido"; exit 1
-  fi
-  if ! openssl rsa -in "${WILDCARD_KEY}" -check -noout >/dev/null 2>&1 && ! openssl pkey -in "${WILDCARD_KEY}" -text -noout >/dev/null 2>&1; then
-    echo "ERROR: llave privada inválida"; exit 1
-  fi
-  cat "${WILDCARD_KEY}" "${WILDCARD_CERT}" > "${WILDCARD_PEM_DST}"
-  chmod 600 "${WILDCARD_PEM_DST}" || true
-  MITM_CERT_ARG="${WILDCARD_DOMAIN}=${WILDCARD_PEM_DST}"
-  cp "${WILDCARD_CERT}" "${CERT_PEM_DST}" && chmod 644 "${CERT_PEM_DST}" || true
-  command -v openssl >/dev/null 2>&1 && openssl x509 -outform der -in "${WILDCARD_CERT}" -out "${CERT_CER_DST}" || true
-  chmod 644 "${CERT_CER_DST}" || true
-fi
-
-# ---------------------------
-# 5) venv + paquetes
-# ---------------------------
-echo "==> Creando venv en ${VENV_DIR} e instalando mitmproxy+scapy (puede tardar)..."
-python3 -m venv "${VENV_DIR}"
-"${VENV_DIR}/bin/python" -m pip install --upgrade pip setuptools wheel >/dev/null
-"${VENV_DIR}/bin/pip" install mitmproxy scapy >/dev/null || true
-
-# ---------------------------
-# 6) CA: mitmproxy bootstrap -> fallback OpenSSL
-# ---------------------------
 echo
 echo "===== OPCIÓN CA ====="
 echo "1) Generar CA automáticamente (recomendado)"
@@ -530,7 +420,7 @@ def del_iptables():
         if rule_exists(r2): run_cmd(["iptables","-t","nat","-D","PREROUTING"]+r2)
     except Exception as e: print("Error borrando regla 443:", e)
 def build_mitmdump_cmd(bin_path):
-    cmd=[bin_path,"--mode","transparent","--listen-port",str(MITM_PORT)]
+    cmd=[bin_path,"--mode","transparent","--listen-port",str(MITM_PORT),"--set","http2=false"]
     if MITM_CERT:
         cmd.extend(["--certs", MITM_CERT])
     cmd.extend(["-s",MITM_ADDON])
