@@ -210,7 +210,7 @@ IFACE = os.environ.get("HORUS_IFACE","tun0")
 os.makedirs(os.path.dirname(OUTFILE), exist_ok=True)
 open(OUTFILE,"a").close()
 def now(): return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-def is_syn(pkt): 
+def is_syn(pkt):
     try: return pkt[TCP].flags & 0x02 and not (pkt[TCP].flags & 0x10)
     except Exception: return False
 def handle(pkt):
@@ -225,6 +225,8 @@ def main():
 if __name__=="__main__": main()
 PYSSHF
 chmod 755 "${HORUS_DIR}/ssh_flow_sniffer.py"
+
+MITM_CERT_ARG=""
 
 # ---------------------------
 # 5) venv + paquetes
@@ -700,6 +702,7 @@ cat > "${WRAPPER_PURGE}" <<'PURGE'
 exec /usr/local/bin/horus uninstall
 PURGE
 chmod 755 "${WRAPPER_PURGE}"
+
 
 # ---------------------------
 # 10) Final
