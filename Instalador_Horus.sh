@@ -18,6 +18,7 @@ WRAPPER_PURGE="/usr/local/bin/horus-uninstall"
 MITM_CONF_DIR="/root/.mitmproxy"
 BOOTLOG="/root/mitmproxy_bootstrap.log"
 LOG_DIR="/var/log/horus"
+EXCEPTIONS_FILE="${HORUS_DIR}/exceptions.txt"
 
 echo "==== Instalador Horus (full, logs en ${LOG_DIR}) ===="
 
@@ -90,6 +91,7 @@ echo "Usando interfaz ${IF_IN} y prefijo ${VPN_NET_PREFIX} (se formará ${VPN_NE
 mkdir -p "${HORUS_DIR}" "${LOG_DIR}"
 chown -R root:root "${HORUS_DIR}" "${LOG_DIR}"
 chmod 755 "${HORUS_DIR}" "${LOG_DIR}"
+touch "${EXCEPTIONS_FILE}" && chmod 600 "${EXCEPTIONS_FILE}"
 
 if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce)" = "Enforcing" ]; then
   echo "SELinux Enforcing: ajustando contexto para ${LOG_DIR}..."
@@ -337,14 +339,124 @@ else
 fi
 
 # ---------------------------
+# 5) venv + paquetes
+# ---------------------------
+echo "==> Creando venv en ${VENV_DIR} e instalando mitmproxy+scapy (puede tardar)..."
+python3 -m venv "${VENV_DIR}"
+"${VENV_DIR}/bin/python" -m pip install --upgrade pip setuptools wheel >/dev/null
+"${VENV_DIR}/bin/pip" install mitmproxy scapy >/dev/null || true
+
+# ---------------------------
+# 6) CA: mitmproxy bootstrap -> fallback OpenSSL
+# ---------------------------
+echo
+echo "===== OPCIÓN CA ====="
+echo "1) Generar CA automáticamente (recomendado)"
+echo "2) Usar CA + KEY existentes (tú entregas rutas absolutas)"
+echo "3) Usar certificado wildcard existente (*.dominio)"
+read -r -p "Selecciona 1, 2 o 3 [1]: " CA_CHOICE
+CA_CHOICE="${CA_CHOICE:-1}"
+
+mkdir -p "${MITM_CONF_DIR}"
+MITM_CERT_ARG=""
+rm -f "${WILDCARD_PEM_DST}" || true
+if [ "${CA_CHOICE}" = "1" ]; then
+  echo "==> Intentando generar CA con mitmproxy (bootstrap forzado)..."
+  export HOME=/root LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+  rm -f "${BOOTLOG}" || true
+  if [ -x "${MITM_ENTRY}" ]; then
+    "${MITM_ENTRY}" --set confdir="${MITM_CONF_DIR}" --listen-port 0 -s /dev/null -q > "${BOOTLOG}" 2>&1 &
+  else
+    "${MITMPROXY_PY}" -m mitmproxy.tools.dump --set confdir="${MITM_CONF_DIR}" --listen-port 0 -s /dev/null -q > "${BOOTLOG}" 2>&1 &
+  fi
+  MPID=$!
+  for _ in {1..10}; do sleep 1; [ -f "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" ] && break; done
+  kill ${MPID} >/dev/null 2>&1 || true; wait ${MPID} 2>/dev/null || true
+  if [ -f "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" ]; then
+    cp "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" "${CERT_PEM_DST}"; chmod 644 "${CERT_PEM_DST}"
+    command -v openssl >/dev/null 2>&1 && openssl x509 -outform der -in "${CERT_PEM_DST}" -out "${CERT_CER_DST}" || true
+    chmod 644 "${CERT_CER_DST}" || true
+  else
+    echo "WARNING: mitmproxy no generó CA. Usando fallback OpenSSL..."
+    set -eux
+    openssl genrsa -out "${MITM_CONF_DIR}/mitmproxy-ca.key" 4096
+    openssl req -x509 -new -nodes -key "${MITM_CONF_DIR}/mitmproxy-ca.key" \
+      -sha256 -days 3650 \
+      -subj "/C=CO/O=Horus/OU=Monitoring/CN=Horus MITM Root CA" \
+      -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
+      -addext "keyUsage=critical,keyCertSign,cRLSign" \
+      -addext "subjectKeyIdentifier=hash" \
+      -addext "authorityKeyIdentifier=keyid:always,issuer:always" \
+      -out "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem"
+    cat "${MITM_CONF_DIR}/mitmproxy-ca.key" "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" > "${MITM_CONF_DIR}/mitmproxy-ca.pem"
+    chmod 600 "${MITM_CONF_DIR}/mitmproxy-ca.key" "${MITM_CONF_DIR}/mitmproxy-ca.pem"
+    chmod 644 "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem"
+    cp "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" "${CERT_PEM_DST}"; chmod 644 "${CERT_PEM_DST}"
+    command -v openssl >/dev/null 2>&1 && openssl x509 -outform der -in "${CERT_PEM_DST}" -out "${CERT_CER_DST}" || true
+    chmod 644 "${CERT_CER_DST}" || true
+    set +eux
+  fi
+elif [ "${CA_CHOICE}" = "2" ]; then
+  echo "==> Usar CA existente"
+  read -r -p "CERT PEM (CA o PEM combinado) [/root/my-ca.pem]: " USER_CERT
+  USER_CERT="${USER_CERT:-/root/my-ca.pem}"
+  read -r -p "KEY (si el CERT no incluye la KEY) [/root/my-ca.key]: " USER_KEY
+  USER_KEY="${USER_KEY:-}"
+  [ -f "${USER_CERT}" ] || { echo "ERROR: no existe ${USER_CERT}"; exit 1; }
+  [ -z "${USER_KEY}" ] || [ -f "${USER_KEY}" ] || { echo "ERROR: no existe ${USER_KEY}"; exit 1; }
+  if ! openssl x509 -in "${USER_CERT}" -noout -text >/tmp/_horus_cert.txt 2>/dev/null; then
+    echo "ERROR: no se pudo leer ${USER_CERT}"; exit 1
+  fi
+  grep -q "CA:TRUE" /tmp/_horus_cert.txt || { echo "ERROR: NO es una CA (wildcard de web no sirve)."; exit 1; }
+  if grep -q "PRIVATE KEY" "${USER_CERT}" 2>/dev/null; then
+    cp "${USER_CERT}" "${MITM_CONF_DIR}/mitmproxy-ca.pem"
+    awk '/-----BEGIN CERTIFICATE-----/{f=1}f{print}/-----END CERTIFICATE-----/{exit}' "${USER_CERT}" > "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" || cp "${USER_CERT}" "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem"
+  else
+    [ -n "${USER_KEY}" ] || { echo "ERROR: certificado sin KEY."; exit 1; }
+    cat "${USER_KEY}" "${USER_CERT}" > "${MITM_CONF_DIR}/mitmproxy-ca.pem"
+    cp "${USER_CERT}" "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem"
+  fi
+  chmod 600 "${MITM_CONF_DIR}/mitmproxy-ca.pem" || true
+  chmod 644 "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" || true
+  cp "${MITM_CONF_DIR}/mitmproxy-ca-cert.pem" "${CERT_PEM_DST}"; chmod 644 "${CERT_PEM_DST}"
+  command -v openssl >/dev/null 2>&1 && openssl x509 -outform der -in "${CERT_PEM_DST}" -out "${CERT_CER_DST}" || true
+  chmod 644 "${CERT_CER_DST}" || true
+else
+  echo "==> Usar certificado wildcard (*.dominio)"
+  read -r -p "Dominio wildcard (ej: *.example.com): " WILDCARD_DOMAIN
+  if [ -z "${WILDCARD_DOMAIN}" ]; then
+    echo "ERROR: dominio wildcard requerido"; exit 1
+  fi
+  read -r -p "Ruta CERT (PEM) [/root/wildcard.crt]: " WILDCARD_CERT
+  WILDCARD_CERT="${WILDCARD_CERT:-/root/wildcard.crt}"
+  read -r -p "Ruta KEY  (PEM) [/root/wildcard.key]: " WILDCARD_KEY
+  WILDCARD_KEY="${WILDCARD_KEY:-/root/wildcard.key}"
+  [ -f "${WILDCARD_CERT}" ] || { echo "ERROR: no existe ${WILDCARD_CERT}"; exit 1; }
+  [ -f "${WILDCARD_KEY}" ] || { echo "ERROR: no existe ${WILDCARD_KEY}"; exit 1; }
+  if ! openssl x509 -in "${WILDCARD_CERT}" -noout >/dev/null 2>&1; then
+    echo "ERROR: certificado inválido"; exit 1
+  fi
+  if ! openssl rsa -in "${WILDCARD_KEY}" -check -noout >/dev/null 2>&1 && ! openssl pkey -in "${WILDCARD_KEY}" -text -noout >/dev/null 2>&1; then
+    echo "ERROR: llave privada inválida"; exit 1
+  fi
+  cat "${WILDCARD_KEY}" "${WILDCARD_CERT}" > "${WILDCARD_PEM_DST}"
+  chmod 600 "${WILDCARD_PEM_DST}" || true
+  MITM_CERT_ARG="${WILDCARD_DOMAIN}=${WILDCARD_PEM_DST}"
+  cp "${WILDCARD_CERT}" "${CERT_PEM_DST}" && chmod 644 "${CERT_PEM_DST}" || true
+  command -v openssl >/dev/null 2>&1 && openssl x509 -outform der -in "${WILDCARD_CERT}" -out "${CERT_CER_DST}" || true
+  chmod 644 "${CERT_CER_DST}" || true
+fi
+
+# ---------------------------
 # 7) horus.py (arranca 3 procesos + ssh flow)
 # ---------------------------
-printf 'IF_IN = "%s"\nVPN_NET = "%s0/24"\nMITM_ADDON = "%s"\nMITM_PORT = 8080\nMITMDUMP_BIN = "%s"\nCERT_PATH = "%s"\nCERT_PATH_WIN = "%s"\nMITM_CERT = "%s"\nSSH_WATCHER = "%s"\nFLOW_SNIFFER = "%s"\nSSH_FLOW_SNIFFER = "%s"\nHTTP_LOG = "%s/http_access.log"\nSSH_LOG = "%s/ssh_access.log"\nFLOW_LOG = "%s/flows.csv"\n\n' \
-  "${IF_IN}" "${VPN_NET_PREFIX}" "${HORUS_DIR}/mitm_simple_logger.py" "${MITM_ENTRY}" "${CERT_PEM_DST}" "${CERT_CER_DST}" "${MITM_CERT_ARG}" "${HORUS_DIR}/ssh_log_watcher.py" "${HORUS_DIR}/flow_sniffer.py" "${HORUS_DIR}/ssh_flow_sniffer.py" "${LOG_DIR}" "${LOG_DIR}" "${LOG_DIR}" > "${HORUS_DIR}/horus.py"
+printf 'IF_IN = "%s"\nVPN_NET = "%s0/24"\nMITM_ADDON = "%s"\nMITM_PORT = 8080\nMITMDUMP_BIN = "%s"\nCERT_PATH = "%s"\nCERT_PATH_WIN = "%s"\nMITM_CERT = "%s"\nSSH_WATCHER = "%s"\nFLOW_SNIFFER = "%s"\nSSH_FLOW_SNIFFER = "%s"\nHTTP_LOG = "%s/http_access.log"\nSSH_LOG = "%s/ssh_access.log"\nFLOW_LOG = "%s/flows.csv"\nEXCEPTIONS_FILE = "%s"\n\n' \
+  "${IF_IN}" "${VPN_NET_PREFIX}" "${HORUS_DIR}/mitm_simple_logger.py" "${MITM_ENTRY}" "${CERT_PEM_DST}" "${CERT_CER_DST}" "${MITM_CERT_ARG}" "${HORUS_DIR}/ssh_log_watcher.py" "${HORUS_DIR}/flow_sniffer.py" "${HORUS_DIR}/ssh_flow_sniffer.py" "${LOG_DIR}" "${LOG_DIR}" "${LOG_DIR}" "${EXCEPTIONS_FILE}" > "${HORUS_DIR}/horus.py"
 
 cat >> "${HORUS_DIR}/horus.py" <<'PYHORUS'
 #!/usr/bin/env python3
 import subprocess, signal, time, os, sys
+from typing import List
 def print_banner():
     print(r"""
   _   _   ____   _   _   ____   _____
@@ -373,7 +485,23 @@ def run_cmd(cmd):
     try: return subprocess.check_call(cmd)
     except subprocess.CalledProcessError as e:
         print("Comando falló:", e); return e.returncode
+def load_exceptions() -> List[str]:
+    if not EXCEPTIONS_FILE or not os.path.exists(EXCEPTIONS_FILE):
+        return []
+    try:
+        with open(EXCEPTIONS_FILE, "r") as f:
+            return [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
+    except Exception:
+        return []
 def add_iptables():
+    for ip in load_exceptions():
+        for port in ("80", "443"):
+            rule=["-i",IF_IN,"-s",VPN_NET,"-d",ip,"-p","tcp","--dport",port,"-j","RETURN"]
+            try:
+                if not rule_exists(rule):
+                    run_cmd(["iptables","-t","nat","-I","PREROUTING"]+rule)
+            except Exception:
+                pass
     try: run_cmd(["iptables","-t","nat","-A","PREROUTING","-i",IF_IN,"-s",VPN_NET,"-p","tcp","--dport","80","-j","REDIRECT","--to-ports",str(MITM_PORT)])
     except Exception: pass
     try: run_cmd(["iptables","-t","nat","-A","PREROUTING","-i",IF_IN,"-s",VPN_NET,"-p","tcp","--dport","443","-j","REDIRECT","--to-ports",str(MITM_PORT)])
@@ -386,6 +514,13 @@ def rule_exists(rule):
         return True
     except Exception: return False
 def del_iptables():
+    for ip in load_exceptions():
+        for port in ("80", "443"):
+            r=["-i",IF_IN,"-s",VPN_NET,"-d",ip,"-p","tcp","--dport",port,"-j","RETURN"]
+            try:
+                if rule_exists(r): run_cmd(["iptables","-t","nat","-D","PREROUTING"]+r)
+            except Exception as e:
+                print("Error borrando bypass", ip, port, e)
     r1=["-i",IF_IN,"-s",VPN_NET,"-p","tcp","--dport","80","-j","REDIRECT","--to-ports",str(MITM_PORT)]
     r2=["-i",IF_IN,"-s",VPN_NET,"-p","tcp","--dport","443","-j","REDIRECT","--to-ports",str(MITM_PORT)]
     try:
@@ -480,6 +615,7 @@ HORUS_DIR="/opt/horus"
 LOG_DIR="/var/log/horus"
 CERT_PEM="${HORUS_DIR}/mitmproxy-ca-cert.pem"   # Linux/macOS/Firefox usa PEM
 CERT_CER="${HORUS_DIR}/mitmproxy-ca-cert.cer"   # Windows usa CER (DER)
+EXCEPTIONS_FILE="${HORUS_DIR}/exceptions.txt"
 
 print_help() {
   cat <<'HHELP'
@@ -493,15 +629,24 @@ Uso:
   horus logs          Muestra últimos 200 de HTTP y SSH
   horus flows         Muestra últimos 200 de flows.csv
   horus certpath      Muestra rutas de certificados (Windows y Linux/macOS)
+  horus excepcion add <IP>     Añade una IP a la lista de excepciones
+  horus excepcion remove <IP>  Quita una IP de la lista de excepciones
+  horus excepcion list         Lista IPs exceptuadas
   horus install-cert /ruta/al/mitmproxy-ca-cert.cer   Copia un .cer al dir de Horus
   horus uninstall     Desinstala COMPLETAMENTE Horus (purga total)
   horus help|-h       Esta ayuda
 HHELP
 }
 
-purge_iptables() {
-  # Lee IF_IN, VPN_NET y MITM_PORT desde /opt/horus/horus.py
-  local IF_IN VPN_NET MITM_PORT
+valid_ip() {
+  printf '%s' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+}
+
+ensure_exceptions_file() {
+  [ -f "${EXCEPTIONS_FILE}" ] || { touch "${EXCEPTIONS_FILE}" && chmod 600 "${EXCEPTIONS_FILE}"; }
+}
+
+load_horus_vars() {
   IF_IN=$(python3 - <<'PY'
 import re; c=open("/opt/horus/horus.py").read()
 m=re.search(r'IF_IN\s*=\s*"([^"]+)"',c); print(m.group(1) if m else "tun0")
@@ -517,6 +662,44 @@ import re; c=open("/opt/horus/horus.py").read()
 m=re.search(r'MITM_PORT\s*=\s*(\d+)',c); print(m.group(1) if m else "8080")
 PY
 )
+}
+
+rule_exists() {
+  iptables -t nat -C PREROUTING "$@" >/dev/null 2>&1
+}
+
+add_bypass_rules() {
+  local ip="$1"
+  load_horus_vars
+  ensure_exceptions_file
+  for port in 80 443; do
+    if ! rule_exists -i "$IF_IN" -s "$VPN_NET" -d "$ip" -p tcp --dport "$port" -j RETURN; then
+      iptables -t nat -I PREROUTING -i "$IF_IN" -s "$VPN_NET" -d "$ip" -p tcp --dport "$port" -j RETURN || true
+    fi
+  done
+}
+
+del_bypass_rules() {
+  local ip="$1"
+  load_horus_vars
+  ensure_exceptions_file
+  for port in 80 443; do
+    rule_exists -i "$IF_IN" -s "$VPN_NET" -d "$ip" -p tcp --dport "$port" -j RETURN \
+      && iptables -t nat -D PREROUTING -i "$IF_IN" -s "$VPN_NET" -d "$ip" -p tcp --dport "$port" -j RETURN || true
+  done
+}
+
+purge_iptables() {
+  # Lee IF_IN, VPN_NET y MITM_PORT desde /opt/horus/horus.py
+  load_horus_vars
+
+  if [ -f "${EXCEPTIONS_FILE}" ]; then
+    while IFS= read -r ip; do
+      [ -z "$ip" ] && continue
+      case "$ip" in \#*) continue ;; esac
+      del_bypass_rules "$ip"
+    done < "${EXCEPTIONS_FILE}"
+  fi
 
   # Sin arrays (compatible sh/bash)
   iptables -t nat -C PREROUTING -i "$IF_IN" -s "$VPN_NET" -p tcp --dport 80  -j REDIRECT --to-ports "$MITM_PORT" >/dev/null 2>&1 \
@@ -572,6 +755,41 @@ case "${1:-help}" in
   certpath)
     echo "Windows (CER/DER): ${CERT_CER}"
     echo "Linux/macOS/Firefox (PEM): ${CERT_PEM}"
+    ;;
+  excepcion)
+    action="${2:-list}"
+    ensure_exceptions_file
+    case "$action" in
+      add)
+        ip="${3:-}"
+        if ! valid_ip "$ip"; then echo "Uso: horus excepcion add <IP>"; exit 2; fi
+        if ! grep -Fxq "$ip" "${EXCEPTIONS_FILE}" 2>/dev/null; then
+          echo "$ip" >> "${EXCEPTIONS_FILE}"
+        fi
+        add_bypass_rules "$ip"
+        echo "IP ${ip} añadida a excepciones"
+        ;;
+      remove)
+        ip="${3:-}"
+        if ! valid_ip "$ip"; then echo "Uso: horus excepcion remove <IP>"; exit 2; fi
+        if [ -f "${EXCEPTIONS_FILE}" ]; then
+          tmpfile=$(mktemp)
+          grep -Fxv "$ip" "${EXCEPTIONS_FILE}" > "$tmpfile" || true
+          mv "$tmpfile" "${EXCEPTIONS_FILE}" && chmod 600 "${EXCEPTIONS_FILE}"
+        fi
+        del_bypass_rules "$ip"
+        echo "IP ${ip} eliminada de excepciones"
+        ;;
+      list)
+        if [ -s "${EXCEPTIONS_FILE}" ]; then
+          cat "${EXCEPTIONS_FILE}"
+        else
+          echo "No hay excepciones configuradas"
+        fi
+        ;;
+      *)
+        echo "Uso: horus excepcion [add|remove|list] <IP>"; exit 2 ;;
+    esac
     ;;
   install-cert)
     if [ -z "${2:-}" ]; then echo "Uso: horus install-cert /ruta/al/mitmproxy-ca-cert.cer"; exit 2; fi
