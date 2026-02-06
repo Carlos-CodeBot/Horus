@@ -210,7 +210,7 @@ IFACE = os.environ.get("HORUS_IFACE","tun0")
 os.makedirs(os.path.dirname(OUTFILE), exist_ok=True)
 open(OUTFILE,"a").close()
 def now(): return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-def is_syn(pkt): 
+def is_syn(pkt):
     try: return pkt[TCP].flags & 0x02 and not (pkt[TCP].flags & 0x10)
     except Exception: return False
 def handle(pkt):
@@ -225,6 +225,8 @@ def main():
 if __name__=="__main__": main()
 PYSSHF
 chmod 755 "${HORUS_DIR}/ssh_flow_sniffer.py"
+
+MITM_CERT_ARG=""
 
 # ---------------------------
 # 5) venv + paquetes
@@ -520,7 +522,6 @@ Uso:
   horus excepcion add <IP>     Añade una IP a la lista de excepciones
   horus excepcion remove <IP>  Quita una IP de la lista de excepciones
   horus excepcion list         Lista IPs exceptuadas
-  horus actualizar    Actualiza Horus desde el repo configurado en /etc/horus.env
   horus install-cert /ruta/al/mitmproxy-ca-cert.cer   Copia un .cer al dir de Horus
   horus uninstall     Desinstala COMPLETAMENTE Horus (purga total)
   horus help|-h       Esta ayuda
@@ -533,15 +534,6 @@ valid_ip() {
 
 ensure_exceptions_file() {
   [ -f "${EXCEPTIONS_FILE}" ] || { touch "${EXCEPTIONS_FILE}" && chmod 600 "${EXCEPTIONS_FILE}"; }
-}
-
-load_update_env() {
-  if [ -f /etc/horus.env ]; then
-    # shellcheck disable=SC1091
-    . /etc/horus.env
-  fi
-  HORUS_UPDATE_REPO="${HORUS_UPDATE_REPO:-}"
-  HORUS_UPDATE_REF="${HORUS_UPDATE_REF:-main}"
 }
 
 load_horus_vars() {
@@ -761,6 +753,8 @@ cat > "${WRAPPER_PURGE}" <<'PURGE'
 exec /usr/local/bin/horus uninstall
 PURGE
 chmod 755 "${WRAPPER_PURGE}"
+
+
 
 # ---------------------------
 # 10) Final
