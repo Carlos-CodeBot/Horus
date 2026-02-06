@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Instalador_Horus.sh (tu base + fixes: wrapper logs, uninstall fuerte, SSH dst, purga total)
+# Instalador_Horus.sh
 # Ejecutar como root.
+#Herramienta desarrollada por H4cker.
 
 set -euo pipefail
 IFS=$'\n\t'
