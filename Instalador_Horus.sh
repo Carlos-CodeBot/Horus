@@ -632,10 +632,58 @@ do_uninstall() {
   echo "Horus desinstalado COMPLETAMENTE."
 }
 
+update_horus() {
+  load_update_env
+  if [ -z "${HORUS_UPDATE_REPO}" ]; then
+    echo "Configura HORUS_UPDATE_REPO en /etc/horus.env para usar 'horus actualizar'."
+    return 2
+  fi
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "Este comando necesita permisos de root."
+    return 1
+  fi
+  local tmpdir backup_exc
+  tmpdir=$(mktemp -d)
+  backup_exc=$(mktemp)
+  if [ -f "${EXCEPTIONS_FILE}" ]; then
+    cp "${EXCEPTIONS_FILE}" "${backup_exc}"
+  fi
+  echo "[*] Actualizando desde ${HORUS_UPDATE_REPO} (${HORUS_UPDATE_REF})..."
+  git clone --depth 1 --branch "${HORUS_UPDATE_REF}" "${HORUS_UPDATE_REPO}" "${tmpdir}/horus" >/dev/null 2>&1 || {
+    echo "ERROR: no se pudo clonar el repositorio."
+    rm -rf "${tmpdir}" "${backup_exc}"
+    return 1
+  }
+  if [ ! -f "${tmpdir}/horus/Instalador_Horus.sh" ]; then
+    echo "ERROR: Instalador_Horus.sh no encontrado en el repositorio."
+    rm -rf "${tmpdir}" "${backup_exc}"
+    return 1
+  fi
+  bash "${tmpdir}/horus/Instalador_Horus.sh"
+  if [ -s "${backup_exc}" ]; then
+    cp "${backup_exc}" "${EXCEPTIONS_FILE}"
+    chmod 600 "${EXCEPTIONS_FILE}"
+  fi
+  rm -rf "${tmpdir}" "${backup_exc}"
+  echo "[*] Actualización completada."
+}
+
 case "${1:-help}" in
-  start)    systemctl start ${HORUS_SERVICE}; systemctl status ${HORUS_SERVICE} --no-pager ;;
-  stop)     systemctl stop ${HORUS_SERVICE} ;;
-  restart)  systemctl restart ${HORUS_SERVICE}; systemctl status ${HORUS_SERVICE} --no-pager ;;
+  start)
+    purge_iptables
+    systemctl start ${HORUS_SERVICE}
+    systemctl status ${HORUS_SERVICE} --no-pager
+    ;;
+  stop)
+    systemctl stop ${HORUS_SERVICE} || true
+    purge_iptables
+    ;;
+  restart)
+    systemctl stop ${HORUS_SERVICE} || true
+    purge_iptables
+    systemctl start ${HORUS_SERVICE}
+    systemctl status ${HORUS_SERVICE} --no-pager
+    ;;
   status)   systemctl status ${HORUS_SERVICE} --no-pager ;;
   logs)
     echo "=== HTTP ===";  tail -n 200 "${LOG_DIR}/http_access.log" 2>/dev/null || echo "No hay http_access.log"
@@ -684,6 +732,9 @@ case "${1:-help}" in
   install-cert)
     if [ -z "${2:-}" ]; then echo "Uso: horus install-cert /ruta/al/mitmproxy-ca-cert.cer"; exit 2; fi
     cp "$2" "${CERT_CER}" && chmod 644 "${CERT_CER}" && echo "Cert copiado a ${CERT_CER}"
+    ;;
+  actualizar)
+    update_horus
     ;;
   uninstall) do_uninstall ;;
   help|--help|-h|*) print_help ;;
