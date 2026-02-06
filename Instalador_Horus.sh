@@ -231,6 +231,8 @@ MITM_CERT_ARG=""
 # ---------------------------
 # 5) venv + paquetes
 # ---------------------------
+# 5) venv + paquetes
+# ---------------------------
 echo "==> Creando venv en ${VENV_DIR} e instalando mitmproxy+scapy (puede tardar)..."
 python3 -m venv "${VENV_DIR}"
 "${VENV_DIR}/bin/python" -m pip install --upgrade pip setuptools wheel >/dev/null
@@ -522,6 +524,7 @@ Uso:
   horus excepcion add <IP>     Añade una IP a la lista de excepciones
   horus excepcion remove <IP>  Quita una IP de la lista de excepciones
   horus excepcion list         Lista IPs exceptuadas
+  horus actualizar    Actualiza Horus desde el repo configurado en /etc/horus.env
   horus install-cert /ruta/al/mitmproxy-ca-cert.cer   Copia un .cer al dir de Horus
   horus uninstall     Desinstala COMPLETAMENTE Horus (purga total)
   horus help|-h       Esta ayuda
@@ -534,6 +537,15 @@ valid_ip() {
 
 ensure_exceptions_file() {
   [ -f "${EXCEPTIONS_FILE}" ] || { touch "${EXCEPTIONS_FILE}" && chmod 600 "${EXCEPTIONS_FILE}"; }
+}
+
+load_update_env() {
+  if [ -f /etc/horus.env ]; then
+    # shellcheck disable=SC1091
+    . /etc/horus.env
+  fi
+  HORUS_UPDATE_REPO="${HORUS_UPDATE_REPO:-}"
+  HORUS_UPDATE_REF="${HORUS_UPDATE_REF:-main}"
 }
 
 load_horus_vars() {
