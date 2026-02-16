@@ -164,10 +164,10 @@ def run():
 if __name__ == "__main__": run()
 PYSSH
 
-# flow sniffer IP/TCP/UDP general
+# flow sniffer optimizado para alto tráfico (muestreo + escritura por lotes)
 cat > "${HORUS_DIR}/flow_sniffer.py" <<'PYSNIFF'
 #!/usr/bin/env python3
-import os, sys, csv
+import os, sys, csv, time
 from datetime import datetime
 try:
     from scapy.all import sniff, IP, TCP, UDP
@@ -176,22 +176,66 @@ except Exception:
     sys.exit(2)
 LOG_CSV = "/var/log/horus/flows.csv"
 IFACE = os.environ.get("HORUS_IFACE","tun0")
+FLOW_MIN_INTERVAL = float(os.environ.get("HORUS_FLOW_MIN_INTERVAL","5"))
+FLUSH_EVERY = float(os.environ.get("HORUS_FLOW_FLUSH_EVERY","2"))
 os.makedirs(os.path.dirname(LOG_CSV), exist_ok=True)
 if not os.path.exists(LOG_CSV):
-    with open(LOG_CSV,"w",newline="") as f: csv.writer(f).writerow(["timestamp","src_ip","dst_ip","dst_port","protocol"])
+    with open(LOG_CSV,"w",newline="") as f:
+        csv.writer(f).writerow(["timestamp","src_ip","dst_ip","dst_port","protocol"])
+
 def now(): return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+def is_syn(pkt):
+    try: return pkt[TCP].flags & 0x02 and not (pkt[TCP].flags & 0x10)
+    except Exception: return False
+
+LAST_SEEN = {}
+PENDING = []
+LAST_FLUSH = time.time()
+
+def should_log(key):
+    t = time.time()
+    last = LAST_SEEN.get(key, 0)
+    if t - last < FLOW_MIN_INTERVAL:
+        return False
+    LAST_SEEN[key] = t
+    return True
+
+def flush(force=False):
+    global LAST_FLUSH
+    t = time.time()
+    if not PENDING:
+        return
+    if not force and (t - LAST_FLUSH) < FLUSH_EVERY:
+        return
+    with open(LOG_CSV,"a",newline="") as f:
+        csv.writer(f).writerows(PENDING)
+    PENDING.clear()
+    LAST_FLUSH = t
+
 def handle(pkt):
-    if not pkt.haslayer(IP): return
+    if not pkt.haslayer(IP):
+        return
+    src_ip, dst_ip = pkt[IP].src, pkt[IP].dst
     if pkt.haslayer(TCP):
+        if not is_syn(pkt):
+            return
         proto, dport = "TCP", pkt[TCP].dport
     elif pkt.haslayer(UDP):
         proto, dport = "UDP", pkt[UDP].dport
-    else: return
-    with open(LOG_CSV,"a",newline="") as f:
-        csv.writer(f).writerow([now(), pkt[IP].src, pkt[IP].dst, str(dport), proto])
+    else:
+        return
+    key = (src_ip, dst_ip, int(dport), proto)
+    if not should_log(key):
+        return
+    PENDING.append([now(), src_ip, dst_ip, str(dport), proto])
+    flush()
+
 def main():
     iface = sys.argv[1] if len(sys.argv)>1 else IFACE
-    sniff(iface=iface, filter="ip and (tcp or udp)", prn=handle, store=False)
+    try:
+        sniff(iface=iface, filter="ip and (tcp or udp)", prn=handle, store=False)
+    finally:
+        flush(force=True)
 if __name__=="__main__": main()
 PYSNIFF
 chmod 755 "${HORUS_DIR}/flow_sniffer.py"
