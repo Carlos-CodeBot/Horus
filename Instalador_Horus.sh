@@ -2,7 +2,7 @@
 # Instalador_Horus.sh
 # Ejecutar como root.
 #Herramienta desarrollada por H4cker.
-
+#modulo de alta carga
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -27,6 +27,8 @@ if [ "$(id -u)" -ne 0 ]; then
   echo "Este script necesita permisos de root. Ejecuta con sudo."
   exit 1
 fi
+
+
 
 echo "Aviso: Asegúrate de tener autorización para interceptar TLS en las máquinas objetivo."
 
