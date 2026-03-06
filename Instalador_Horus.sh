@@ -120,15 +120,14 @@ def now(): return datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 class SimpleLogger:
     def __init__(self):
         ctx.log.info(f"mitm_simple_logger logging to {OUTFILE}")
-        open(OUTFILE, "a").close()
+        self._fh = open(OUTFILE, "a", buffering=1)
     def response(self, flow: http.HTTPFlow):
         try:
             cip = flow.client_conn.address[0] if flow.client_conn and getattr(flow.client_conn,"address",None) else ""
             m   = flow.request.method or "-"
             url = flow.request.pretty_url if getattr(flow.request,"pretty_url",None) else (flow.request.path or "-")
             sc  = flow.response.status_code if flow.response else "-"
-            with open(OUTFILE, "a") as f:
-                f.write(f"{now()}\t{cip}\t{m}\t{url}\t{sc}\n")
+            self._fh.write(f"{now()}\t{cip}\t{m}\t{url}\t{sc}\n")
         except Exception as e:
             ctx.log.error(f"mitm_simple_logger error: {e}")
 addons = [ SimpleLogger() ]
@@ -140,7 +139,7 @@ cat >> "${HORUS_DIR}/ssh_log_watcher.py" <<'PYSSH'
 import re, subprocess, os, datetime
 OUTFILE = "/var/log/horus/ssh_access.log"
 os.makedirs(os.path.dirname(OUTFILE), exist_ok=True)
-open(OUTFILE, "a").close()
+LOGFH = open(OUTFILE, "a", buffering=1)
 RE_ACC = re.compile(r"Accepted .* for (?P<user>\S+) from (?P<ip>\d+\.\d+\.\d+\.\d+)")
 RE_FAIL= re.compile(r"Failed .* for (invalid user )?(?P<user>\S+) from (?P<ip>\d+\.\d+\.\d+\.\d+)")
 def now(): return datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
@@ -159,131 +158,19 @@ def run():
             ip, user = m.group("ip"), m.group("user")
             if not ip.startswith(VPN_NET_PREFIX): continue
             ev = "ACCEPTED" if "Accepted " in line else "FAILED"
-            with open(OUTFILE,"a") as f:
-                f.write(f"{now()}\t{ip}\t{ev}\t{user}\t{line.strip()}\n")
+            LOGFH.write(f"{now()}\t{ip}\t{ev}\t{user}\t{line.strip()}\n")
     except KeyboardInterrupt:
         p.terminate()
 if __name__ == "__main__": run()
 PYSSH
 
-# flow sniffer optimizado para alto tráfico (muestreo + escritura por lotes)
-cat > "${HORUS_DIR}/flow_sniffer.py" <<'PYSNIFF'
-#!/usr/bin/env python3
-import os, sys, csv, time
-from datetime import datetime
-try:
-    from scapy.all import sniff, IP, TCP, UDP
-except Exception:
-    print("ERROR: falta scapy en venv. Instala con /opt/horus/venv/bin/pip install scapy")
-    sys.exit(2)
-LOG_CSV = "/var/log/horus/flows.csv"
-IFACE = os.environ.get("HORUS_IFACE","tun0")
-FLOW_MIN_INTERVAL = float(os.environ.get("HORUS_FLOW_MIN_INTERVAL","5"))
-FLUSH_EVERY = float(os.environ.get("HORUS_FLOW_FLUSH_EVERY","2"))
-os.makedirs(os.path.dirname(LOG_CSV), exist_ok=True)
-if not os.path.exists(LOG_CSV):
-    with open(LOG_CSV,"w",newline="") as f:
-        csv.writer(f).writerow(["timestamp","src_ip","dst_ip","dst_port","protocol"])
-
-def now(): return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-def is_syn(pkt):
-    try: return pkt[TCP].flags & 0x02 and not (pkt[TCP].flags & 0x10)
-    except Exception: return False
-
-LAST_SEEN = {}
-PENDING = []
-LAST_FLUSH = time.time()
-
-def should_log(key):
-    t = time.time()
-    last = LAST_SEEN.get(key, 0)
-    if t - last < FLOW_MIN_INTERVAL:
-        return False
-    LAST_SEEN[key] = t
-    return True
-
-def flush(force=False):
-    global LAST_FLUSH
-    t = time.time()
-    if not PENDING:
-        return
-    if not force and (t - LAST_FLUSH) < FLUSH_EVERY:
-        return
-    with open(LOG_CSV,"a",newline="") as f:
-        csv.writer(f).writerows(PENDING)
-    PENDING.clear()
-    LAST_FLUSH = t
-
-def handle(pkt):
-    if not pkt.haslayer(IP):
-        return
-    src_ip, dst_ip = pkt[IP].src, pkt[IP].dst
-    if pkt.haslayer(TCP):
-        if not is_syn(pkt):
-            return
-        proto, dport = "TCP", pkt[TCP].dport
-    elif pkt.haslayer(UDP):
-        proto, dport = "UDP", pkt[UDP].dport
-    else:
-        return
-    key = (src_ip, dst_ip, int(dport), proto)
-    if not should_log(key):
-        return
-    PENDING.append([now(), src_ip, dst_ip, str(dport), proto])
-    flush()
-
-def main():
-    iface = sys.argv[1] if len(sys.argv)>1 else IFACE
-    try:
-        sniff(iface=iface, filter="ip and (tcp or udp)", prn=handle, store=False)
-    finally:
-        flush(force=True)
-if __name__=="__main__": main()
-PYSNIFF
-chmod 755 "${HORUS_DIR}/flow_sniffer.py"
-
-# NUEVO: sniffer específico de SSH (SYN -> 22) para origen/destino en el mismo ssh_access.log
-cat > "${HORUS_DIR}/ssh_flow_sniffer.py" <<'PYSSHF'
-#!/usr/bin/env python3
-import os, sys
-from datetime import datetime
-try:
-    from scapy.all import sniff, IP, TCP
-except Exception:
-    print("ERROR: falta scapy. /opt/horus/venv/bin/pip install scapy")
-    sys.exit(2)
-OUTFILE = "/var/log/horus/ssh_access.log"
-IFACE = os.environ.get("HORUS_IFACE","tun0")
-os.makedirs(os.path.dirname(OUTFILE), exist_ok=True)
-open(OUTFILE,"a").close()
-def now(): return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-def is_syn(pkt):
-    try: return pkt[TCP].flags & 0x02 and not (pkt[TCP].flags & 0x10)
-    except Exception: return False
-def handle(pkt):
-    if not (pkt.haslayer(IP) and pkt.haslayer(TCP)): return
-    if pkt[TCP].dport != 22: return
-    if not is_syn(pkt): return
-    with open(OUTFILE,"a") as f:
-        f.write(f"{now()}\tFLOW\t{pkt[IP].src}\t{pkt[IP].dst}\t22\tTCP\n")
-def main():
-    iface = sys.argv[1] if len(sys.argv)>1 else IFACE
-    sniff(iface=iface, filter="tcp port 22", prn=handle, store=False)
-if __name__=="__main__": main()
-PYSSHF
-chmod 755 "${HORUS_DIR}/ssh_flow_sniffer.py"
-
-MITM_CERT_ARG=""
-
 # ---------------------------
 # 5) venv + paquetes
 # ---------------------------
-# 5) venv + paquetes
-# ---------------------------
-echo "==> Creando venv en ${VENV_DIR} e instalando mitmproxy+scapy (puede tardar)..."
+echo "==> Creando venv en ${VENV_DIR} e instalando mitmproxy (puede tardar)..."
 python3 -m venv "${VENV_DIR}"
 "${VENV_DIR}/bin/python" -m pip install --upgrade pip setuptools wheel >/dev/null
-"${VENV_DIR}/bin/pip" install mitmproxy scapy >/dev/null || true
+"${VENV_DIR}/bin/pip" install mitmproxy >/dev/null || true
 
 # ---------------------------
 # 6) CA: mitmproxy bootstrap -> fallback OpenSSL
@@ -386,11 +273,15 @@ else
   chmod 644 "${CERT_CER_DST}" || true
 fi
 
+MITM_CERT_ARG=""
+
 # ---------------------------
-# 7) horus.py (arranca 3 procesos + ssh flow)
+# 5) venv + paquetes
 # ---------------------------
-printf 'IF_IN = "%s"\nVPN_NET = "%s0/24"\nMITM_ADDON = "%s"\nMITM_PORT = 8080\nMITMDUMP_BIN = "%s"\nCERT_PATH = "%s"\nCERT_PATH_WIN = "%s"\nMITM_CERT = "%s"\nSSH_WATCHER = "%s"\nFLOW_SNIFFER = "%s"\nSSH_FLOW_SNIFFER = "%s"\nHTTP_LOG = "%s/http_access.log"\nSSH_LOG = "%s/ssh_access.log"\nFLOW_LOG = "%s/flows.csv"\nEXCEPTIONS_FILE = "%s"\n\n' \
-  "${IF_IN}" "${VPN_NET_PREFIX}" "${HORUS_DIR}/mitm_simple_logger.py" "${MITM_ENTRY}" "${CERT_PEM_DST}" "${CERT_CER_DST}" "${MITM_CERT_ARG}" "${HORUS_DIR}/ssh_log_watcher.py" "${HORUS_DIR}/flow_sniffer.py" "${HORUS_DIR}/ssh_flow_sniffer.py" "${LOG_DIR}" "${LOG_DIR}" "${LOG_DIR}" "${EXCEPTIONS_FILE}" > "${HORUS_DIR}/horus.py"
+# 7) horus.py (arranca 2 procesos: mitm + ssh watcher)
+# ---------------------------
+printf 'IF_IN = "%s"\nVPN_NET = "%s0/24"\nMITM_ADDON = "%s"\nMITM_PORT = 8080\nMITMDUMP_BIN = "%s"\nCERT_PATH = "%s"\nCERT_PATH_WIN = "%s"\nMITM_CERT = "%s"\nSSH_WATCHER = "%s"\nHTTP_LOG = "%s/http_access.log"\nSSH_LOG = "%s/ssh_access.log"\nEXCEPTIONS_FILE = "%s"\n\n' \
+  "${IF_IN}" "${VPN_NET_PREFIX}" "${HORUS_DIR}/mitm_simple_logger.py" "${MITM_ENTRY}" "${CERT_PEM_DST}" "${CERT_CER_DST}" "${MITM_CERT_ARG}" "${HORUS_DIR}/ssh_log_watcher.py" "${LOG_DIR}" "${LOG_DIR}" "${EXCEPTIONS_FILE}" > "${HORUS_DIR}/horus.py"
 
 cat >> "${HORUS_DIR}/horus.py" <<'PYHORUS'
 #!/usr/bin/env python3
@@ -485,14 +376,12 @@ def start_py(mod):
 def main():
     check_root(); print_banner()
     print("Interfaz:", IF_IN, "VPN:", VPN_NET)
-    for p in (HTTP_LOG,SSH_LOG,FLOW_LOG):
+    for p in (HTTP_LOG,SSH_LOG):
         os.makedirs(os.path.dirname(p), exist_ok=True); open(p,"a").close()
     add_iptables()
     procs = [
         start_mitmdump(),
-        start_py(SSH_WATCHER),
-        start_py(FLOW_SNIFFER),
-        start_py(SSH_FLOW_SNIFFER)
+        start_py(SSH_WATCHER)
     ]
     def shutdown(*_):
         for pr in procs:
@@ -525,7 +414,7 @@ chmod 644 "${HORUS_DIR}/mitm_simple_logger.py" "${HORUS_DIR}/ssh_log_watcher.py"
 # ---------------------------
 cat > "${HORUS_SERVICE}" <<'EOF'
 [Unit]
-Description=Horus - simple VPN HTTP+SSH tracer (mitm + ssh watcher + flow sniffer)
+Description=Horus - simple VPN HTTP+SSH tracer (mitm + ssh watcher)
 After=network.target
 
 [Service]
@@ -566,7 +455,6 @@ Uso:
   horus restart       Reinicia el servicio y muestra status
   horus status        Muestra estado del servicio
   horus logs          Muestra últimos 200 de HTTP y SSH
-  horus flows         Muestra últimos 200 de flows.csv
   horus certpath      Muestra rutas de certificados (Windows y Linux/macOS)
   horus excepcion add <IP>     Añade una IP a la lista de excepciones
   horus excepcion remove <IP>  Quita una IP de la lista de excepciones
@@ -666,8 +554,6 @@ do_uninstall() {
   echo "[*] Matando procesos residuales..."
   pkill -f "/opt/horus/venv/bin/mitmdump" 2>/dev/null || true
   pkill -f "/opt/horus/ssh_log_watcher.py" 2>/dev/null || true
-  pkill -f "/opt/horus/ssh_flow_sniffer.py" 2>/dev/null || true
-  pkill -f "/opt/horus/flow_sniffer.py" 2>/dev/null || true
   pkill -f "/opt/horus/horus.py" 2>/dev/null || true
 
   echo "[*] Quitando reglas NAT (iptables)..."
@@ -748,7 +634,6 @@ case "${1:-help}" in
     echo "=== HTTP ===";  tail -n 200 "${LOG_DIR}/http_access.log" 2>/dev/null || echo "No hay http_access.log"
     echo "=== SSH  ===";  tail -n 200 "${LOG_DIR}/ssh_access.log"  2>/dev/null || echo "No hay ssh_access.log"
     ;;
-  flows)    tail -n 200 "${LOG_DIR}/flows.csv" 2>/dev/null || echo "No hay flows.csv" ;;
   certpath)
     echo "Windows (CER/DER): ${CERT_CER}"
     echo "Linux/macOS/Firefox (PEM): ${CERT_PEM}"
@@ -822,7 +707,7 @@ echo "==== Instalación completada ===="
 echo " - Horus instalado en: ${HORUS_DIR}"
 echo " - Servicio systemd: horus.service"
 echo " - Wrapper: ${WRAPPER} (usa 'horus -h') y symlink /usr/bin/horus"
-echo " - Logs: ${LOG_DIR}/http_access.log, ${LOG_DIR}/ssh_access.log, ${LOG_DIR}/flows.csv"
+echo " - Logs: ${LOG_DIR}/http_access.log, ${LOG_DIR}/ssh_access.log"
 echo
 echo "Certificados para distribuir a los clientes VPN:"
 echo " - Windows (formato CER/DER): ${CERT_CER_DST}"
