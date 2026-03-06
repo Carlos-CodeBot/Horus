@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Instalador_Horus.sh (tu base + fixes: wrapper logs, uninstall fuerte, SSH dst, purga total)
+# Instalador_Horus.sh
 # Ejecutar como root.
-
+#Herramienta desarrollada por H4cker.
+#modulo de alta carga
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -26,6 +27,8 @@ if [ "$(id -u)" -ne 0 ]; then
   echo "Este script necesita permisos de root. Ejecuta con sudo."
   exit 1
 fi
+
+
 
 echo "Aviso: Asegúrate de tener autorización para interceptar TLS en las máquinas objetivo."
 
@@ -270,6 +273,10 @@ else
   chmod 644 "${CERT_CER_DST}" || true
 fi
 
+MITM_CERT_ARG=""
+
+# ---------------------------
+# 5) venv + paquetes
 # ---------------------------
 # 7) horus.py (arranca 2 procesos: mitm + ssh watcher)
 # ---------------------------
@@ -690,6 +697,8 @@ cat > "${WRAPPER_PURGE}" <<'PURGE'
 exec /usr/local/bin/horus uninstall
 PURGE
 chmod 755 "${WRAPPER_PURGE}"
+
+
 
 # ---------------------------
 # 10) Final
