@@ -3,6 +3,7 @@
 # Ejecutar como root.
 #Herramienta desarrollada por H4cker.
 #modulo de alta carga
+
 set -euo pipefail
 IFS=$'\n\t'
 
