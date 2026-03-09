@@ -410,6 +410,138 @@ chmod 755 "${HORUS_DIR}/horus.py"
 chmod 644 "${HORUS_DIR}/mitm_simple_logger.py" "${HORUS_DIR}/ssh_log_watcher.py"
 
 # ---------------------------
+# 7) horus.py (arranca 2 procesos: mitm + ssh watcher)
+# ---------------------------
+printf 'IF_IN = "%s"\nVPN_NET = "%s0/24"\nMITM_ADDON = "%s"\nMITM_PORT = 8080\nMITMDUMP_BIN = "%s"\nCERT_PATH = "%s"\nCERT_PATH_WIN = "%s"\nMITM_CERT = "%s"\nSSH_WATCHER = "%s"\nHTTP_LOG = "%s/http_access.log"\nSSH_LOG = "%s/ssh_access.log"\nEXCEPTIONS_FILE = "%s"\n\n' \
+  "${IF_IN}" "${VPN_NET_PREFIX}" "${HORUS_DIR}/mitm_simple_logger.py" "${MITM_ENTRY}" "${CERT_PEM_DST}" "${CERT_CER_DST}" "${MITM_CERT_ARG}" "${HORUS_DIR}/ssh_log_watcher.py" "${LOG_DIR}" "${LOG_DIR}" "${EXCEPTIONS_FILE}" > "${HORUS_DIR}/horus.py"
+
+cat >> "${HORUS_DIR}/horus.py" <<'PYHORUS'
+#!/usr/bin/env python3
+import subprocess, signal, time, os, sys
+from typing import List
+def print_banner():
+    print(r"""
+  _   _   ____   _   _   ____   _____
+ | | | | / ___| | | | | / ___| | ____|
+ | | | || |  _  | | | | \___ \ |  _|
+ | |_| || |_| | | |_| |  ___) || |___
+  \___/  \____|  \___/  |____/ |_____|
+      _      ____  _   _  _____
+           .--.
+         .'_\/_'.
+        '. /\ /.'     ,--.
+          "||"       /    \
+         _.'  '._    \\    /
+       .'  .--.  '.   `--'
+      /   (    )   \
+""")
+    print("Horus iniciado. Cert PEM:", CERT_PATH)
+    print("Cert CER (Windows):", CERT_PATH_WIN)
+    if MITM_CERT:
+        print("Cert wildcard cargado:", MITM_CERT)
+    print()
+def check_root():
+    if os.geteuid() != 0:
+        print("Horus necesita ejecutarse como root."); sys.exit(1)
+def run_cmd(cmd):
+    try: return subprocess.check_call(cmd)
+    except subprocess.CalledProcessError as e:
+        print("Comando falló:", e); return e.returncode
+def load_exceptions() -> List[str]:
+    if not EXCEPTIONS_FILE or not os.path.exists(EXCEPTIONS_FILE):
+        return []
+    try:
+        with open(EXCEPTIONS_FILE, "r") as f:
+            return [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
+    except Exception:
+        return []
+def add_iptables():
+    for ip in load_exceptions():
+        for port in ("80", "443"):
+            rule=["-i",IF_IN,"-s",VPN_NET,"-d",ip,"-p","tcp","--dport",port,"-j","RETURN"]
+            try:
+                if not rule_exists(rule):
+                    run_cmd(["iptables","-t","nat","-I","PREROUTING"]+rule)
+            except Exception:
+                pass
+    try: run_cmd(["iptables","-t","nat","-A","PREROUTING","-i",IF_IN,"-s",VPN_NET,"-p","tcp","--dport","80","-j","REDIRECT","--to-ports",str(MITM_PORT)])
+    except Exception: pass
+    try: run_cmd(["iptables","-t","nat","-A","PREROUTING","-i",IF_IN,"-s",VPN_NET,"-p","tcp","--dport","443","-j","REDIRECT","--to-ports",str(MITM_PORT)])
+    except Exception: pass
+    try: run_cmd(["sysctl","-w","net.ipv4.ip_forward=1"])
+    except Exception: pass
+def rule_exists(rule):
+    try:
+        subprocess.check_call(["iptables","-t","nat","-C","PREROUTING"]+rule, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception: return False
+def del_iptables():
+    for ip in load_exceptions():
+        for port in ("80", "443"):
+            r=["-i",IF_IN,"-s",VPN_NET,"-d",ip,"-p","tcp","--dport",port,"-j","RETURN"]
+            try:
+                if rule_exists(r): run_cmd(["iptables","-t","nat","-D","PREROUTING"]+r)
+            except Exception as e:
+                print("Error borrando bypass", ip, port, e)
+    r1=["-i",IF_IN,"-s",VPN_NET,"-p","tcp","--dport","80","-j","REDIRECT","--to-ports",str(MITM_PORT)]
+    r2=["-i",IF_IN,"-s",VPN_NET,"-p","tcp","--dport","443","-j","REDIRECT","--to-ports",str(MITM_PORT)]
+    try:
+        if rule_exists(r1): run_cmd(["iptables","-t","nat","-D","PREROUTING"]+r1)
+    except Exception as e: print("Error borrando regla 80:", e)
+    try:
+        if rule_exists(r2): run_cmd(["iptables","-t","nat","-D","PREROUTING"]+r2)
+    except Exception as e: print("Error borrando regla 443:", e)
+def build_mitmdump_cmd(bin_path):
+    cmd=[bin_path,"--mode","transparent","--listen-port",str(MITM_PORT),"--set","http2=false"]
+    if MITM_CERT:
+        cmd.extend(["--certs", MITM_CERT])
+    cmd.extend(["-s",MITM_ADDON])
+    return cmd
+def start_mitmdump():
+    if os.path.exists(MITMDUMP_BIN):
+        return subprocess.Popen(build_mitmdump_cmd(MITMDUMP_BIN))
+    return subprocess.Popen(build_mitmdump_cmd("mitmdump"))
+def start_py(mod):
+    vpy = os.path.join(os.path.dirname(MITMDUMP_BIN), "python")
+    if os.path.exists(vpy): return subprocess.Popen([vpy, mod])
+    return subprocess.Popen(["python3", mod])
+def main():
+    check_root(); print_banner()
+    print("Interfaz:", IF_IN, "VPN:", VPN_NET)
+    for p in (HTTP_LOG,SSH_LOG):
+        os.makedirs(os.path.dirname(p), exist_ok=True); open(p,"a").close()
+    add_iptables()
+    procs = [
+        start_mitmdump(),
+        start_py(SSH_WATCHER)
+    ]
+    def shutdown(*_):
+        for pr in procs:
+            try: pr.terminate()
+            except Exception: pass
+        time.sleep(1); del_iptables(); sys.exit(0)
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+    try:
+        while True:
+            dead=[p for p in procs if p.poll() is not None]
+            if dead:
+                print("Subproceso terminó, cerrando Horus."); break
+            time.sleep(1)
+    except KeyboardInterrupt:
+        shutdown()
+if __name__ == "__main__": main()
+PYHORUS
+
+# Asegurar shebang + CRLF
+if ! head -n1 "${HORUS_DIR}/horus.py" | grep -q '^#!'; then
+  sed -i '1i #!/usr/bin/env python3' "${HORUS_DIR}/horus.py"
+fi
+command -v dos2unix >/dev/null 2>&1 && dos2unix "${HORUS_DIR}/horus.py" || true
+chmod 755 "${HORUS_DIR}/horus.py"
+chmod 644 "${HORUS_DIR}/mitm_simple_logger.py" "${HORUS_DIR}/ssh_log_watcher.py"
+
+# ---------------------------
 # 8) systemd unit y arranque
 # ---------------------------
 cat > "${HORUS_SERVICE}" <<'EOF'
