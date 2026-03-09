@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Instalador_Horus.sh (tu base + fixes: wrapper logs, uninstall fuerte, SSH dst, purga total)
+# Instalador_Horus.sh
 # Ejecutar como root.
-
+#Herramienta desarrollada por H4cker.
+#modulo de alta carga
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -26,6 +27,8 @@ if [ "$(id -u)" -ne 0 ]; then
   echo "Este script necesita permisos de root. Ejecuta con sudo."
   exit 1
 fi
+
+
 
 echo "Aviso: Asegúrate de tener autorización para interceptar TLS en las máquinas objetivo."
 
@@ -117,15 +120,14 @@ def now(): return datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 class SimpleLogger:
     def __init__(self):
         ctx.log.info(f"mitm_simple_logger logging to {OUTFILE}")
-        open(OUTFILE, "a").close()
+        self._fh = open(OUTFILE, "a", buffering=1)
     def response(self, flow: http.HTTPFlow):
         try:
             cip = flow.client_conn.address[0] if flow.client_conn and getattr(flow.client_conn,"address",None) else ""
             m   = flow.request.method or "-"
             url = flow.request.pretty_url if getattr(flow.request,"pretty_url",None) else (flow.request.path or "-")
             sc  = flow.response.status_code if flow.response else "-"
-            with open(OUTFILE, "a") as f:
-                f.write(f"{now()}\t{cip}\t{m}\t{url}\t{sc}\n")
+            self._fh.write(f"{now()}\t{cip}\t{m}\t{url}\t{sc}\n")
         except Exception as e:
             ctx.log.error(f"mitm_simple_logger error: {e}")
 addons = [ SimpleLogger() ]
@@ -137,7 +139,7 @@ cat >> "${HORUS_DIR}/ssh_log_watcher.py" <<'PYSSH'
 import re, subprocess, os, datetime
 OUTFILE = "/var/log/horus/ssh_access.log"
 os.makedirs(os.path.dirname(OUTFILE), exist_ok=True)
-open(OUTFILE, "a").close()
+LOGFH = open(OUTFILE, "a", buffering=1)
 RE_ACC = re.compile(r"Accepted .* for (?P<user>\S+) from (?P<ip>\d+\.\d+\.\d+\.\d+)")
 RE_FAIL= re.compile(r"Failed .* for (invalid user )?(?P<user>\S+) from (?P<ip>\d+\.\d+\.\d+\.\d+)")
 def now(): return datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
@@ -156,8 +158,7 @@ def run():
             ip, user = m.group("ip"), m.group("user")
             if not ip.startswith(VPN_NET_PREFIX): continue
             ev = "ACCEPTED" if "Accepted " in line else "FAILED"
-            with open(OUTFILE,"a") as f:
-                f.write(f"{now()}\t{ip}\t{ev}\t{user}\t{line.strip()}\n")
+            LOGFH.write(f"{now()}\t{ip}\t{ev}\t{user}\t{line.strip()}\n")
     except KeyboardInterrupt:
         p.terminate()
 if __name__ == "__main__": run()
@@ -703,6 +704,8 @@ cat > "${WRAPPER_PURGE}" <<'PURGE'
 exec /usr/local/bin/horus uninstall
 PURGE
 chmod 755 "${WRAPPER_PURGE}"
+
+
 
 # ---------------------------
 # 10) Final
