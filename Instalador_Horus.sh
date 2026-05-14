@@ -122,13 +122,55 @@ class SimpleLogger:
     def __init__(self):
         ctx.log.info(f"mitm_simple_logger logging to {OUTFILE}")
         self._fh = open(OUTFILE, "a", buffering=1)
+
     def response(self, flow: http.HTTPFlow):
         try:
-            cip = flow.client_conn.address[0] if flow.client_conn and getattr(flow.client_conn,"address",None) else ""
-            m   = flow.request.method or "-"
-            url = flow.request.pretty_url if getattr(flow.request,"pretty_url",None) else (flow.request.path or "-")
-            sc  = flow.response.status_code if flow.response else "-"
-            self._fh.write(f"{now()}\t{cip}\t{m}\t{url}\t{sc}\n")
+            fecha = now()
+
+            # IP del cliente dentro de la VPN
+            ip_cliente = (
+                flow.client_conn.address[0]
+                if flow.client_conn and getattr(flow.client_conn, "address", None)
+                else "-"
+            )
+
+            metodo = flow.request.method or "-"
+
+            # Dominio consultado, por ejemplo: example.com
+            dominio = (
+                flow.request.host
+                or flow.request.pretty_host
+                or flow.request.headers.get("Host", "-")
+                or "-"
+            )
+
+            # Puerto destino, por ejemplo: 80 o 443
+            puerto_destino = flow.request.port or "-"
+
+            # IP real a la que mitmproxy conectó, si está disponible
+            ip_destino = "-"
+            try:
+                if flow.server_conn and getattr(flow.server_conn, "address", None):
+                    ip_destino = flow.server_conn.address[0]
+            except Exception:
+                ip_destino = "-"
+
+            # Ruta solicitada, por ejemplo: /login?id=1
+            ruta = flow.request.path or "-"
+
+            # URL completa reconstruida por mitmproxy
+            url = (
+                flow.request.pretty_url
+                if getattr(flow.request, "pretty_url", None)
+                else ruta
+            )
+
+            codigo = flow.response.status_code if flow.response else "-"
+
+            self._fh.write(
+                f"{fecha}\t{ip_cliente}\t{dominio}\t{ip_destino}\t{puerto_destino}\t{metodo}\t{ruta}\t{url}\t{codigo}\n"
+            )
+
         except Exception as e:
             ctx.log.error(f"mitm_simple_logger error: {e}")
 addons = [ SimpleLogger() ]
