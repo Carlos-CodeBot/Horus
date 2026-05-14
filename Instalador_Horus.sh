@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Instalador_Horus.sh
 # Ejecutar como root.
-#Herramienta desarrollada por H4cker.
-#modulo de alta carga
+# Herramienta desarrollada por H4cker.
+# Modulo de alta carga
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -29,9 +29,7 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-
-
-echo "Aviso: Asegúrate de tener autorización para interceptar TLS en las máquinas objetivo."
+echo "Aviso: Asegurate de tener autorizacion para interceptar TLS en las maquinas objetivo."
 
 # ---------------------------
 # 1) Dependencias
@@ -40,12 +38,12 @@ if command -v dnf >/dev/null 2>&1; then
   echo "==> Instalando dependencias con dnf..."
   dnf -y install python3 python3-virtualenv python3-pip python3-devel gcc \
                  openssl-devel libffi-devel redhat-rpm-config iptables iproute \
-                 dos2unix glibc-langpack-en policycoreutils-python-utils || true
+                 dos2unix glibc-langpack-en policycoreutils-python-utils git || true
 elif command -v apt-get >/dev/null 2>&1; then
   echo "==> Instalando dependencias con apt..."
   apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv python3-pip python3-dev gcc \
-                                                  libssl-dev libffi-dev iptables iproute2 dos2unix policycoreutils || true
+                                                  libssl-dev libffi-dev iptables iproute2 dos2unix policycoreutils git || true
   export LANG=en_US.UTF-8
   locale-gen en_US.UTF-8 || true
 else
@@ -63,9 +61,10 @@ detect_interface() {
   [ -n "$IF" ] && { echo "$IF"; return; }
   echo ""
 }
+
 IF_IN="$(detect_interface)"
 if [ -z "${IF_IN}" ]; then
-  read -r -p "No se detectó interfaz tun/tap automáticamente. Ingresa la interfaz a usar [tun0]: " IF_IN
+  read -r -p "No se detecto interfaz tun/tap automaticamente. Ingresa la interfaz a usar [tun0]: " IF_IN
   IF_IN="${IF_IN:-tun0}"
 else
   echo "Interfaz detectada: ${IF_IN}"
@@ -83,11 +82,13 @@ if [ -n "${IP_ADDR}" ]; then
 else
   VPN_NET_PREFIX=""
 fi
+
 if [ -z "${VPN_NET_PREFIX}" ]; then
   read -r -p "Prefijo /24 de la VPN (ej: 192.168.2.) [192.168.2.]: " TMP_PREFIX
   VPN_NET_PREFIX="${TMP_PREFIX:-192.168.2.}"
 fi
-echo "Usando interfaz ${IF_IN} y prefijo ${VPN_NET_PREFIX} (se formará ${VPN_NET_PREFIX}0/24)"
+
+echo "Usando interfaz ${IF_IN} y prefijo ${VPN_NET_PREFIX} (se formara ${VPN_NET_PREFIX}0/24)"
 
 # ---------------------------
 # 3) Preparar dirs + SELinux
@@ -110,14 +111,19 @@ if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce)" = "Enforcing" ]; t
 fi
 
 # ---------------------------
-# 4) Addons y módulos
+# 4) Addons y modulos
 # ---------------------------
 cat > "${HORUS_DIR}/mitm_simple_logger.py" <<'PYMITM'
 from mitmproxy import http, ctx
-import datetime, os
+import datetime
+import os
+
 OUTFILE = "/var/log/horus/http_access.log"
 os.makedirs(os.path.dirname(OUTFILE), exist_ok=True)
-def now(): return datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+def now():
+    return datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
 class SimpleLogger:
     def __init__(self):
         ctx.log.info(f"mitm_simple_logger logging to {OUTFILE}")
@@ -126,57 +132,175 @@ class SimpleLogger:
     def response(self, flow: http.HTTPFlow):
         try:
             fecha = now()
-
-            # IP del cliente dentro de la VPN
             ip_cliente = (
                 flow.client_conn.address[0]
                 if flow.client_conn and getattr(flow.client_conn, "address", None)
                 else "-"
             )
-
             metodo = flow.request.method or "-"
-
-            # Dominio consultado, por ejemplo: example.com
-            dominio = (
+            host_destino = (
                 flow.request.host
                 or flow.request.pretty_host
                 or flow.request.headers.get("Host", "-")
                 or "-"
             )
-
-            # Puerto destino, por ejemplo: 80 o 443
             puerto_destino = flow.request.port or "-"
-
-            # IP real a la que mitmproxy conectó, si está disponible
             ip_destino = "-"
             try:
                 if flow.server_conn and getattr(flow.server_conn, "address", None):
                     ip_destino = flow.server_conn.address[0]
             except Exception:
                 ip_destino = "-"
-
-            # Ruta solicitada, por ejemplo: /login?id=1
             ruta = flow.request.path or "-"
-
-            # URL completa reconstruida por mitmproxy
-            url = (
-                flow.request.pretty_url
-                if getattr(flow.request, "pretty_url", None)
-                else ruta
-            )
-
+            url = flow.request.pretty_url if getattr(flow.request, "pretty_url", None) else ruta
             codigo = flow.response.status_code if flow.response else "-"
-
             self._fh.write(
-                f"{fecha}\t{ip_cliente}\t{dominio}\t{ip_destino}\t{puerto_destino}\t{metodo}\t{ruta}\t{url}\t{codigo}\n"
+                f"{fecha}\t{ip_cliente}\t{host_destino}\t{ip_destino}\t{puerto_destino}\t{metodo}\t{ruta}\t{url}\t{codigo}\n"
             )
-
         except Exception as e:
             ctx.log.error(f"mitm_simple_logger error: {e}")
-addons = [ SimpleLogger() ]
+
+addons = [SimpleLogger()]
 PYMITM
 
-# watcher de journal sshd (Accepted/Failed)
+cat > "${HORUS_DIR}/mitm_wazuh_logger.py" <<'PYWAZUH'
+from mitmproxy import http, ctx
+import datetime
+import hashlib
+import json
+import os
+
+OUTFILE = "/var/log/horus/http_wazuh.json"
+os.makedirs(os.path.dirname(OUTFILE), exist_ok=True)
+
+def now_iso():
+    return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+def safe_value(value, default="-"):
+    if value is None:
+        return default
+    value = str(value).strip()
+    return value if value else default
+
+def classify_status(status_code):
+    try:
+        code = int(status_code)
+    except Exception:
+        return "unknown"
+    if 200 <= code <= 299:
+        return "success"
+    if 300 <= code <= 399:
+        return "redirect"
+    if 400 <= code <= 499:
+        return "client_error"
+    if 500 <= code <= 599:
+        return "server_error"
+    return "unknown"
+
+def classify_risk(method, path, status_code):
+    method = safe_value(method).upper()
+    path = safe_value(path, "").lower()
+    suspicious_keywords = [
+        "admin", "login", "wp-admin", "phpmyadmin", ".env", "config", "backup",
+        "passwd", "shadow", "shell", "cmd", "select", "union", "../", "%2e%2e",
+        "base64", "eval", "script", "onerror"
+    ]
+    try:
+        code = int(status_code)
+    except Exception:
+        code = 0
+    if any(keyword in path for keyword in suspicious_keywords):
+        return "suspicious"
+    if method in ["PUT", "DELETE", "PATCH"]:
+        return "interesting_method"
+    if code in [401, 403]:
+        return "auth_or_forbidden"
+    if code == 404:
+        return "not_found"
+    if code >= 500:
+        return "server_error"
+    return "normal"
+
+class WazuhHTTPLogger:
+    def __init__(self):
+        ctx.log.info(f"mitm_wazuh_logger logging to {OUTFILE}")
+        self._fh = open(OUTFILE, "a", buffering=1)
+
+    def response(self, flow: http.HTTPFlow):
+        try:
+            timestamp = now_iso()
+            src_ip = "-"
+            src_port = "-"
+            if flow.client_conn and getattr(flow.client_conn, "address", None):
+                src_ip = safe_value(flow.client_conn.address[0])
+                if len(flow.client_conn.address) > 1:
+                    src_port = flow.client_conn.address[1]
+
+            dest_ip = "-"
+            dest_port = "-"
+            if flow.server_conn and getattr(flow.server_conn, "address", None):
+                dest_ip = safe_value(flow.server_conn.address[0])
+                if len(flow.server_conn.address) > 1:
+                    dest_port = flow.server_conn.address[1]
+
+            method = safe_value(flow.request.method)
+            host_destino = safe_value(
+                flow.request.host
+                or flow.request.pretty_host
+                or flow.request.headers.get("Host", "-")
+            )
+            request_port = flow.request.port or dest_port
+            scheme = safe_value(flow.request.scheme)
+            path = safe_value(flow.request.path)
+            url = safe_value(flow.request.pretty_url if getattr(flow.request, "pretty_url", None) else path)
+            status_code = flow.response.status_code if flow.response else "-"
+            status_category = classify_status(status_code)
+            risk = classify_risk(method, path, status_code)
+            user_agent = safe_value(flow.request.headers.get("User-Agent", "-"))
+            content_type = "-"
+            response_size = 0
+            if flow.response:
+                content_type = safe_value(flow.response.headers.get("Content-Type", "-"))
+                try:
+                    response_size = len(flow.response.raw_content or b"")
+                except Exception:
+                    response_size = 0
+
+            request_id_raw = f"{timestamp}|{src_ip}|{host_destino}|{method}|{path}|{status_code}"
+            event_id = hashlib.sha256(request_id_raw.encode()).hexdigest()[:16]
+            event = {
+                "timestamp": timestamp,
+                "event": {
+                    "module": "horus",
+                    "dataset": "horus.http",
+                    "kind": "event",
+                    "category": "web",
+                    "type": "access",
+                    "id": event_id,
+                    "outcome": status_category,
+                    "risk": risk
+                },
+                "source": {"ip": src_ip, "port": src_port},
+                "destination": {"ip": dest_ip, "port": request_port, "domain": host_destino},
+                "http": {
+                    "request": {"method": method},
+                    "response": {
+                        "status_code": status_code,
+                        "body": {"bytes": response_size},
+                        "mime_type": content_type
+                    }
+                },
+                "url": {"scheme": scheme, "domain": host_destino, "path": path, "full": url},
+                "user_agent": {"original": user_agent},
+                "horus": {"log_type": "http_access", "sensor": "horus-mitm"}
+            }
+            self._fh.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+        except Exception as e:
+            ctx.log.error(f"mitm_wazuh_logger error: {e}")
+
+addons = [WazuhHTTPLogger()]
+PYWAZUH
+
 printf 'VPN_NET_PREFIX = "%s"\n\n' "${VPN_NET_PREFIX}" > "${HORUS_DIR}/ssh_log_watcher.py"
 cat >> "${HORUS_DIR}/ssh_log_watcher.py" <<'PYSSH'
 import re, subprocess, os, datetime
@@ -219,9 +343,9 @@ python3 -m venv "${VENV_DIR}"
 # 6) CA: mitmproxy bootstrap -> fallback OpenSSL
 # ---------------------------
 echo
-echo "===== OPCIÓN CA ====="
-echo "1) Generar CA automáticamente (recomendado)"
-echo "2) Usar CA + KEY existentes (tú entregas rutas absolutas)"
+echo "===== OPCION CA ====="
+echo "1) Generar CA automaticamente (recomendado)"
+echo "2) Usar CA + KEY existentes (tu entregas rutas absolutas)"
 echo "3) Usar certificado wildcard existente (*.dominio)"
 read -r -p "Selecciona 1, 2 o 3 [1]: " CA_CHOICE
 CA_CHOICE="${CA_CHOICE:-1}"
@@ -246,7 +370,7 @@ if [ "${CA_CHOICE}" = "1" ]; then
     command -v openssl >/dev/null 2>&1 && openssl x509 -outform der -in "${CERT_PEM_DST}" -out "${CERT_CER_DST}" || true
     chmod 644 "${CERT_CER_DST}" || true
   else
-    echo "WARNING: mitmproxy no generó CA. Usando fallback OpenSSL..."
+    echo "WARNING: mitmproxy no genero CA. Usando fallback OpenSSL..."
     set -eux
     openssl genrsa -out "${MITM_CONF_DIR}/mitmproxy-ca.key" 4096
     openssl req -x509 -new -nodes -key "${MITM_CONF_DIR}/mitmproxy-ca.key" \
@@ -306,13 +430,10 @@ else
   [ -f "${WILDCARD_CHAIN}" ] || { echo "ERROR: no existe ${WILDCARD_CHAIN}"; exit 1; }
   [ -f "${WILDCARD_KEY}" ] || { echo "ERROR: no existe ${WILDCARD_KEY}"; exit 1; }
   if ! openssl x509 -in "${WILDCARD_CERT}" -noout >/dev/null 2>&1; then
-    echo "ERROR: certificado inválido"; exit 1
-  fi
-  if ! openssl x509 -in "${WILDCARD_CHAIN}" -noout >/dev/null 2>&1; then
-    echo "ERROR: fullchain inválido"; exit 1
+    echo "ERROR: certificado invalido"; exit 1
   fi
   if ! openssl rsa -in "${WILDCARD_KEY}" -check -noout >/dev/null 2>&1 && ! openssl pkey -in "${WILDCARD_KEY}" -text -noout >/dev/null 2>&1; then
-    echo "ERROR: llave privada inválida"; exit 1
+    echo "ERROR: llave privada invalida"; exit 1
   fi
   CERT_MOD=$(openssl x509 -noout -modulus -in "${WILDCARD_CERT}" 2>/dev/null | openssl md5 | awk '{print $2}')
   KEY_MOD=$(openssl rsa -noout -modulus -in "${WILDCARD_KEY}" 2>/dev/null | openssl md5 | awk '{print $2}')
@@ -328,15 +449,16 @@ else
 fi
 
 # ---------------------------
-# 7) horus.py (arranca 2 procesos: mitm + ssh watcher)
+# 7) horus.py (arranca mitm + ssh watcher)
 # ---------------------------
-printf 'IF_IN = "%s"\nVPN_NET = "%s0/24"\nMITM_ADDON = "%s"\nMITM_PORT = 8080\nMITMDUMP_BIN = "%s"\nCERT_PATH = "%s"\nCERT_PATH_WIN = "%s"\nMITM_CERT = "%s"\nSSH_WATCHER = "%s"\nHTTP_LOG = "%s/http_access.log"\nSSH_LOG = "%s/ssh_access.log"\nEXCEPTIONS_FILE = "%s"\n\n' \
-  "${IF_IN}" "${VPN_NET_PREFIX}" "${HORUS_DIR}/mitm_simple_logger.py" "${MITM_ENTRY}" "${CERT_PEM_DST}" "${CERT_CER_DST}" "${MITM_CERT_ARG}" "${HORUS_DIR}/ssh_log_watcher.py" "${LOG_DIR}" "${LOG_DIR}" "${EXCEPTIONS_FILE}" > "${HORUS_DIR}/horus.py"
+printf 'IF_IN = "%s"\nVPN_NET = "%s0/24"\nMITM_ADDON = "%s"\nWAZUH_ADDON = "%s"\nMITM_PORT = 8080\nMITMDUMP_BIN = "%s"\nCERT_PATH = "%s"\nCERT_PATH_WIN = "%s"\nMITM_CERT = "%s"\nSSH_WATCHER = "%s"\nHTTP_LOG = "%s/http_access.log"\nWAZUH_LOG = "%s/http_wazuh.json"\nSSH_LOG = "%s/ssh_access.log"\nEXCEPTIONS_FILE = "%s"\n\n' \
+  "${IF_IN}" "${VPN_NET_PREFIX}" "${HORUS_DIR}/mitm_simple_logger.py" "${HORUS_DIR}/mitm_wazuh_logger.py" "${MITM_ENTRY}" "${CERT_PEM_DST}" "${CERT_CER_DST}" "${MITM_CERT_ARG}" "${HORUS_DIR}/ssh_log_watcher.py" "${LOG_DIR}" "${LOG_DIR}" "${LOG_DIR}" "${EXCEPTIONS_FILE}" > "${HORUS_DIR}/horus.py"
 
 cat >> "${HORUS_DIR}/horus.py" <<'PYHORUS'
 #!/usr/bin/env python3
 import subprocess, signal, time, os, sys
 from typing import List
+
 def print_banner():
     print(r"""
   _   _   ____   _   _   ____   _____
@@ -344,27 +466,27 @@ def print_banner():
  | | | || |  _  | | | | \___ \ |  _|
  | |_| || |_| | | |_| |  ___) || |___
   \___/  \____|  \___/  |____/ |_____|
-      _      ____  _   _  _____
-           .--.
-         .'_\/_'.
-        '. /\ /.'     ,--.
-          "||"       /    \
-         _.'  '._    \\    /
-       .'  .--.  '.   `--'
-      /   (    )   \
 """)
     print("Horus iniciado. Cert PEM:", CERT_PATH)
     print("Cert CER (Windows):", CERT_PATH_WIN)
+    print("Log HTTP:", HTTP_LOG)
+    print("Log Wazuh JSON:", WAZUH_LOG)
     if MITM_CERT:
         print("Cert wildcard cargado:", MITM_CERT)
     print()
+
 def check_root():
     if os.geteuid() != 0:
-        print("Horus necesita ejecutarse como root."); sys.exit(1)
+        print("Horus necesita ejecutarse como root.")
+        sys.exit(1)
+
 def run_cmd(cmd):
-    try: return subprocess.check_call(cmd)
+    try:
+        return subprocess.check_call(cmd)
     except subprocess.CalledProcessError as e:
-        print("Comando falló:", e); return e.returncode
+        print("Comando fallo:", e)
+        return e.returncode
+
 def load_exceptions() -> List[str]:
     if not EXCEPTIONS_FILE or not os.path.exists(EXCEPTIONS_FILE):
         return []
@@ -373,91 +495,112 @@ def load_exceptions() -> List[str]:
             return [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
     except Exception:
         return []
+
+def rule_exists(rule):
+    try:
+        subprocess.check_call(["iptables", "-t", "nat", "-C", "PREROUTING"] + rule, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
 def add_iptables():
     for ip in load_exceptions():
         for port in ("80", "443"):
-            rule=["-i",IF_IN,"-s",VPN_NET,"-d",ip,"-p","tcp","--dport",port,"-j","RETURN"]
+            rule = ["-i", IF_IN, "-s", VPN_NET, "-d", ip, "-p", "tcp", "--dport", port, "-j", "RETURN"]
             try:
                 if not rule_exists(rule):
-                    run_cmd(["iptables","-t","nat","-I","PREROUTING"]+rule)
+                    run_cmd(["iptables", "-t", "nat", "-I", "PREROUTING"] + rule)
             except Exception:
                 pass
-    try: run_cmd(["iptables","-t","nat","-A","PREROUTING","-i",IF_IN,"-s",VPN_NET,"-p","tcp","--dport","80","-j","REDIRECT","--to-ports",str(MITM_PORT)])
-    except Exception: pass
-    try: run_cmd(["iptables","-t","nat","-A","PREROUTING","-i",IF_IN,"-s",VPN_NET,"-p","tcp","--dport","443","-j","REDIRECT","--to-ports",str(MITM_PORT)])
-    except Exception: pass
-    try: run_cmd(["sysctl","-w","net.ipv4.ip_forward=1"])
-    except Exception: pass
-def rule_exists(rule):
     try:
-        subprocess.check_call(["iptables","-t","nat","-C","PREROUTING"]+rule, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return True
-    except Exception: return False
+        run_cmd(["iptables", "-t", "nat", "-A", "PREROUTING", "-i", IF_IN, "-s", VPN_NET, "-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-ports", str(MITM_PORT)])
+    except Exception:
+        pass
+    try:
+        run_cmd(["iptables", "-t", "nat", "-A", "PREROUTING", "-i", IF_IN, "-s", VPN_NET, "-p", "tcp", "--dport", "443", "-j", "REDIRECT", "--to-ports", str(MITM_PORT)])
+    except Exception:
+        pass
+    try:
+        run_cmd(["sysctl", "-w", "net.ipv4.ip_forward=1"])
+    except Exception:
+        pass
+
 def del_iptables():
     for ip in load_exceptions():
         for port in ("80", "443"):
-            r=["-i",IF_IN,"-s",VPN_NET,"-d",ip,"-p","tcp","--dport",port,"-j","RETURN"]
+            r = ["-i", IF_IN, "-s", VPN_NET, "-d", ip, "-p", "tcp", "--dport", port, "-j", "RETURN"]
             try:
-                if rule_exists(r): run_cmd(["iptables","-t","nat","-D","PREROUTING"]+r)
+                if rule_exists(r):
+                    run_cmd(["iptables", "-t", "nat", "-D", "PREROUTING"] + r)
             except Exception as e:
                 print("Error borrando bypass", ip, port, e)
-    r1=["-i",IF_IN,"-s",VPN_NET,"-p","tcp","--dport","80","-j","REDIRECT","--to-ports",str(MITM_PORT)]
-    r2=["-i",IF_IN,"-s",VPN_NET,"-p","tcp","--dport","443","-j","REDIRECT","--to-ports",str(MITM_PORT)]
-    try:
-        if rule_exists(r1): run_cmd(["iptables","-t","nat","-D","PREROUTING"]+r1)
-    except Exception as e: print("Error borrando regla 80:", e)
-    try:
-        if rule_exists(r2): run_cmd(["iptables","-t","nat","-D","PREROUTING"]+r2)
-    except Exception as e: print("Error borrando regla 443:", e)
+    for port in ("80", "443"):
+        r = ["-i", IF_IN, "-s", VPN_NET, "-p", "tcp", "--dport", port, "-j", "REDIRECT", "--to-ports", str(MITM_PORT)]
+        try:
+            if rule_exists(r):
+                run_cmd(["iptables", "-t", "nat", "-D", "PREROUTING"] + r)
+        except Exception as e:
+            print("Error borrando regla", port, e)
+
 def build_mitmdump_cmd(bin_path):
-    cmd=[bin_path,"--mode","transparent","--listen-port",str(MITM_PORT),"--set","http2=false"]
+    cmd = [bin_path, "--mode", "transparent", "--listen-port", str(MITM_PORT), "--set", "http2=false"]
     if MITM_CERT:
         cmd.extend(["--certs", MITM_CERT])
-    cmd.extend(["-s",MITM_ADDON])
+    cmd.extend(["-s", MITM_ADDON])
+    cmd.extend(["-s", WAZUH_ADDON])
     return cmd
+
 def start_mitmdump():
     if os.path.exists(MITMDUMP_BIN):
         return subprocess.Popen(build_mitmdump_cmd(MITMDUMP_BIN))
     return subprocess.Popen(build_mitmdump_cmd("mitmdump"))
+
 def start_py(mod):
     vpy = os.path.join(os.path.dirname(MITMDUMP_BIN), "python")
-    if os.path.exists(vpy): return subprocess.Popen([vpy, mod])
+    if os.path.exists(vpy):
+        return subprocess.Popen([vpy, mod])
     return subprocess.Popen(["python3", mod])
+
 def main():
-    check_root(); print_banner()
+    check_root()
+    print_banner()
     print("Interfaz:", IF_IN, "VPN:", VPN_NET)
-    for p in (HTTP_LOG,SSH_LOG):
-        os.makedirs(os.path.dirname(p), exist_ok=True); open(p,"a").close()
+    for p in (HTTP_LOG, WAZUH_LOG, SSH_LOG):
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        open(p, "a").close()
     add_iptables()
-    procs = [
-        start_mitmdump(),
-        start_py(SSH_WATCHER)
-    ]
+    procs = [start_mitmdump(), start_py(SSH_WATCHER)]
     def shutdown(*_):
         for pr in procs:
-            try: pr.terminate()
-            except Exception: pass
-        time.sleep(1); del_iptables(); sys.exit(0)
+            try:
+                pr.terminate()
+            except Exception:
+                pass
+        time.sleep(1)
+        del_iptables()
+        sys.exit(0)
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
     try:
         while True:
-            dead=[p for p in procs if p.poll() is not None]
+            dead = [p for p in procs if p.poll() is not None]
             if dead:
-                print("Subproceso terminó, cerrando Horus."); break
+                print("Subproceso termino, cerrando Horus.")
+                break
             time.sleep(1)
     except KeyboardInterrupt:
         shutdown()
-if __name__ == "__main__": main()
+
+if __name__ == "__main__":
+    main()
 PYHORUS
 
-# Asegurar shebang + CRLF
 if ! head -n1 "${HORUS_DIR}/horus.py" | grep -q '^#!'; then
   sed -i '1i #!/usr/bin/env python3' "${HORUS_DIR}/horus.py"
 fi
 command -v dos2unix >/dev/null 2>&1 && dos2unix "${HORUS_DIR}/horus.py" || true
 chmod 755 "${HORUS_DIR}/horus.py"
-chmod 644 "${HORUS_DIR}/mitm_simple_logger.py" "${HORUS_DIR}/ssh_log_watcher.py"
+chmod 644 "${HORUS_DIR}/mitm_simple_logger.py" "${HORUS_DIR}/mitm_wazuh_logger.py" "${HORUS_DIR}/ssh_log_watcher.py"
 
 # ---------------------------
 # 8) systemd unit y arranque
@@ -482,7 +625,7 @@ systemctl daemon-reload
 systemctl enable --now horus.service || true
 
 # ---------------------------
-# 9) Wrapper (arregla rutas de logs + uninstall fuerte)
+# 9) Wrapper
 # ---------------------------
 cat > /usr/local/bin/horus <<'WRAP'
 #!/usr/bin/env bash
@@ -491,8 +634,8 @@ set -euo pipefail
 HORUS_SERVICE="horus.service"
 HORUS_DIR="/opt/horus"
 LOG_DIR="/var/log/horus"
-CERT_PEM="${HORUS_DIR}/mitmproxy-ca-cert.pem"   # Linux/macOS/Firefox usa PEM
-CERT_CER="${HORUS_DIR}/mitmproxy-ca-cert.cer"   # Windows usa CER (DER)
+CERT_PEM="${HORUS_DIR}/mitmproxy-ca-cert.pem"
+CERT_CER="${HORUS_DIR}/mitmproxy-ca-cert.cer"
 EXCEPTIONS_FILE="${HORUS_DIR}/exceptions.txt"
 
 print_help() {
@@ -504,29 +647,23 @@ Uso:
   horus stop          Detiene el servicio
   horus restart       Reinicia el servicio y muestra status
   horus status        Muestra estado del servicio
-  horus logs          Muestra últimos 200 de HTTP y SSH
-  horus certpath      Muestra rutas de certificados (Windows y Linux/macOS)
-  horus excepcion add <IP>     Añade una IP a la lista de excepciones
-  horus excepcion remove <IP>  Quita una IP de la lista de excepciones
+  horus logs          Muestra ultimos eventos HTTP, Wazuh JSON y SSH
+  horus certpath      Muestra rutas de certificados
+  horus excepcion add <IP>     Anade una IP a excepciones
+  horus excepcion remove <IP>  Quita una IP de excepciones
   horus excepcion list         Lista IPs exceptuadas
-  horus actualizar    Actualiza Horus desde el repo configurado en /etc/horus.env
-  horus install-cert /ruta/al/mitmproxy-ca-cert.cer   Copia un .cer al dir de Horus
-  horus uninstall     Desinstala COMPLETAMENTE Horus (purga total)
+  horus actualizar    Actualiza Horus desde /etc/horus.env
+  horus install-cert /ruta/al/mitmproxy-ca-cert.cer
+  horus uninstall     Desinstala COMPLETAMENTE Horus
   horus help|-h       Esta ayuda
 HHELP
 }
 
-valid_ip() {
-  printf '%s' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'
-}
-
-ensure_exceptions_file() {
-  [ -f "${EXCEPTIONS_FILE}" ] || { touch "${EXCEPTIONS_FILE}" && chmod 600 "${EXCEPTIONS_FILE}"; }
-}
+valid_ip() { printf '%s' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; }
+ensure_exceptions_file() { [ -f "${EXCEPTIONS_FILE}" ] || { touch "${EXCEPTIONS_FILE}" && chmod 600 "${EXCEPTIONS_FILE}"; }; }
 
 load_update_env() {
   if [ -f /etc/horus.env ]; then
-    # shellcheck disable=SC1091
     . /etc/horus.env
   fi
   HORUS_UPDATE_REPO="${HORUS_UPDATE_REPO:-}"
@@ -535,25 +672,29 @@ load_update_env() {
 
 load_horus_vars() {
   IF_IN=$(python3 - <<'PY'
-import re; c=open("/opt/horus/horus.py").read()
-m=re.search(r'IF_IN\s*=\s*"([^"]+)"',c); print(m.group(1) if m else "tun0")
+import re
+c=open("/opt/horus/horus.py").read()
+m=re.search(r'IF_IN\s*=\s*"([^"]+)"', c)
+print(m.group(1) if m else "tun0")
 PY
 )
   VPN_NET=$(python3 - <<'PY'
-import re; c=open("/opt/horus/horus.py").read()
-m=re.search(r'VPN_NET\s*=\s*"([^"]+)"',c); print(m.group(1) if m else "10.38.0.0/24")
+import re
+c=open("/opt/horus/horus.py").read()
+m=re.search(r'VPN_NET\s*=\s*"([^"]+)"', c)
+print(m.group(1) if m else "10.38.0.0/24")
 PY
 )
   MITM_PORT=$(python3 - <<'PY'
-import re; c=open("/opt/horus/horus.py").read()
-m=re.search(r'MITM_PORT\s*=\s*(\d+)',c); print(m.group(1) if m else "8080")
+import re
+c=open("/opt/horus/horus.py").read()
+m=re.search(r'MITM_PORT\s*=\s*(\d+)', c)
+print(m.group(1) if m else "8080")
 PY
 )
 }
 
-rule_exists() {
-  iptables -t nat -C PREROUTING "$@" >/dev/null 2>&1
-}
+rule_exists() { iptables -t nat -C PREROUTING "$@" >/dev/null 2>&1; }
 
 add_bypass_rules() {
   local ip="$1"
@@ -577,9 +718,7 @@ del_bypass_rules() {
 }
 
 purge_iptables() {
-  # Lee IF_IN, VPN_NET y MITM_PORT desde /opt/horus/horus.py
   load_horus_vars
-
   if [ -f "${EXCEPTIONS_FILE}" ]; then
     while IFS= read -r ip; do
       [ -z "$ip" ] && continue
@@ -587,43 +726,32 @@ purge_iptables() {
       del_bypass_rules "$ip"
     done < "${EXCEPTIONS_FILE}"
   fi
-
-  # Sin arrays (compatible sh/bash)
-  iptables -t nat -C PREROUTING -i "$IF_IN" -s "$VPN_NET" -p tcp --dport 80  -j REDIRECT --to-ports "$MITM_PORT" >/dev/null 2>&1 \
-    && iptables -t nat -D PREROUTING -i "$IF_IN" -s "$VPN_NET" -p tcp --dport 80  -j REDIRECT --to-ports "$MITM_PORT" || true
-
-  iptables -t nat -C PREROUTING -i "$IF_IN" -s "$VPN_NET" -p tcp --dport 443 -j REDIRECT --to-ports "$MITM_PORT" >/dev/null 2>&1 \
-    && iptables -t nat -D PREROUTING -i "$IF_IN" -s "$VPN_NET" -p tcp --dport 443 -j REDIRECT --to-ports "$MITM_PORT" || true
+  for port in 80 443; do
+    iptables -t nat -C PREROUTING -i "$IF_IN" -s "$VPN_NET" -p tcp --dport "$port" -j REDIRECT --to-ports "$MITM_PORT" >/dev/null 2>&1 \
+      && iptables -t nat -D PREROUTING -i "$IF_IN" -s "$VPN_NET" -p tcp --dport "$port" -j REDIRECT --to-ports "$MITM_PORT" || true
+  done
 }
 
 do_uninstall() {
   echo "[*] Deteniendo servicio..."
   systemctl stop "${HORUS_SERVICE}" || true
   systemctl disable "${HORUS_SERVICE}" || true
-
   echo "[*] Matando procesos residuales..."
   pkill -f "/opt/horus/venv/bin/mitmdump" 2>/dev/null || true
   pkill -f "/opt/horus/ssh_log_watcher.py" 2>/dev/null || true
   pkill -f "/opt/horus/horus.py" 2>/dev/null || true
-
-  echo "[*] Quitando reglas NAT (iptables)..."
+  echo "[*] Quitando reglas NAT..."
   purge_iptables
-
   echo "[*] Eliminando unit y recargando systemd..."
   rm -f /etc/systemd/system/horus.service
   systemctl daemon-reload
-
   echo "[*] Eliminando archivos y logs..."
   rm -rf /opt/horus /var/log/horus /root/.mitmproxy
-
-  echo "[*] Eliminando wrapper/symlink y PATH..."
   rm -f /usr/local/bin/horus /usr/bin/horus /usr/local/bin/horus-uninstall /etc/profile.d/horus_path.sh
-
   if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce)" = "Enforcing" ]; then
     command -v semanage >/dev/null 2>&1 && semanage fcontext -d '/var/log/horus(/.*)?' 2>/dev/null || true
     restorecon -Rv /var/log >/dev/null 2>&1 || true
   fi
-
   echo "Horus desinstalado COMPLETAMENTE."
 }
 
@@ -640,27 +768,20 @@ update_horus() {
   local tmpdir backup_exc
   tmpdir=$(mktemp -d)
   backup_exc=$(mktemp)
-  if [ -f "${EXCEPTIONS_FILE}" ]; then
-    cp "${EXCEPTIONS_FILE}" "${backup_exc}"
-  fi
+  [ -f "${EXCEPTIONS_FILE}" ] && cp "${EXCEPTIONS_FILE}" "${backup_exc}"
   echo "[*] Actualizando desde ${HORUS_UPDATE_REPO} (${HORUS_UPDATE_REF})..."
   git clone --depth 1 --branch "${HORUS_UPDATE_REF}" "${HORUS_UPDATE_REPO}" "${tmpdir}/horus" >/dev/null 2>&1 || {
     echo "ERROR: no se pudo clonar el repositorio."
     rm -rf "${tmpdir}" "${backup_exc}"
     return 1
   }
-  if [ ! -f "${tmpdir}/horus/Instalador_Horus.sh" ]; then
-    echo "ERROR: Instalador_Horus.sh no encontrado en el repositorio."
-    rm -rf "${tmpdir}" "${backup_exc}"
-    return 1
-  fi
   bash "${tmpdir}/horus/Instalador_Horus.sh"
   if [ -s "${backup_exc}" ]; then
     cp "${backup_exc}" "${EXCEPTIONS_FILE}"
     chmod 600 "${EXCEPTIONS_FILE}"
   fi
   rm -rf "${tmpdir}" "${backup_exc}"
-  echo "[*] Actualización completada."
+  echo "[*] Actualizacion completada."
 }
 
 case "${1:-help}" in
@@ -679,10 +800,11 @@ case "${1:-help}" in
     systemctl start ${HORUS_SERVICE}
     systemctl status ${HORUS_SERVICE} --no-pager
     ;;
-  status)   systemctl status ${HORUS_SERVICE} --no-pager ;;
+  status) systemctl status ${HORUS_SERVICE} --no-pager ;;
   logs)
-    echo "=== HTTP ===";  tail -n 200 "${LOG_DIR}/http_access.log" 2>/dev/null || echo "No hay http_access.log"
-    echo "=== SSH  ===";  tail -n 200 "${LOG_DIR}/ssh_access.log"  2>/dev/null || echo "No hay ssh_access.log"
+    echo "=== HTTP ==="; tail -n 200 "${LOG_DIR}/http_access.log" 2>/dev/null || echo "No hay http_access.log"
+    echo "=== WAZUH JSON ==="; tail -n 50 "${LOG_DIR}/http_wazuh.json" 2>/dev/null || echo "No hay http_wazuh.json"
+    echo "=== SSH ==="; tail -n 200 "${LOG_DIR}/ssh_access.log" 2>/dev/null || echo "No hay ssh_access.log"
     ;;
   certpath)
     echo "Windows (CER/DER): ${CERT_CER}"
@@ -695,74 +817,66 @@ case "${1:-help}" in
       add)
         ip="${3:-}"
         if ! valid_ip "$ip"; then echo "Uso: horus excepcion add <IP>"; exit 2; fi
-        if ! grep -Fxq "$ip" "${EXCEPTIONS_FILE}" 2>/dev/null; then
-          echo "$ip" >> "${EXCEPTIONS_FILE}"
-        fi
+        grep -Fxq "$ip" "${EXCEPTIONS_FILE}" 2>/dev/null || echo "$ip" >> "${EXCEPTIONS_FILE}"
         add_bypass_rules "$ip"
-        echo "IP ${ip} añadida a excepciones"
+        echo "IP ${ip} anadida a excepciones"
         ;;
       remove)
         ip="${3:-}"
         if ! valid_ip "$ip"; then echo "Uso: horus excepcion remove <IP>"; exit 2; fi
-        if [ -f "${EXCEPTIONS_FILE}" ]; then
-          tmpfile=$(mktemp)
-          grep -Fxv "$ip" "${EXCEPTIONS_FILE}" > "$tmpfile" || true
-          mv "$tmpfile" "${EXCEPTIONS_FILE}" && chmod 600 "${EXCEPTIONS_FILE}"
-        fi
+        tmpfile=$(mktemp)
+        grep -Fxv "$ip" "${EXCEPTIONS_FILE}" > "$tmpfile" || true
+        mv "$tmpfile" "${EXCEPTIONS_FILE}" && chmod 600 "${EXCEPTIONS_FILE}"
         del_bypass_rules "$ip"
         echo "IP ${ip} eliminada de excepciones"
         ;;
       list)
-        if [ -s "${EXCEPTIONS_FILE}" ]; then
-          cat "${EXCEPTIONS_FILE}"
-        else
-          echo "No hay excepciones configuradas"
-        fi
+        [ -s "${EXCEPTIONS_FILE}" ] && cat "${EXCEPTIONS_FILE}" || echo "No hay excepciones configuradas"
         ;;
-      *)
-        echo "Uso: horus excepcion [add|remove|list] <IP>"; exit 2 ;;
+      *) echo "Uso: horus excepcion [add|remove|list] <IP>"; exit 2 ;;
     esac
     ;;
   install-cert)
     if [ -z "${2:-}" ]; then echo "Uso: horus install-cert /ruta/al/mitmproxy-ca-cert.cer"; exit 2; fi
     cp "$2" "${CERT_CER}" && chmod 644 "${CERT_CER}" && echo "Cert copiado a ${CERT_CER}"
     ;;
-  actualizar)
-    update_horus
-    ;;
+  actualizar) update_horus ;;
   uninstall) do_uninstall ;;
   help|--help|-h|*) print_help ;;
 esac
 WRAP
 
-# garantizar formato y permisos
 chmod +x /usr/local/bin/horus
 command -v dos2unix >/dev/null 2>&1 && dos2unix /usr/local/bin/horus || true
 ln -sf /usr/local/bin/horus /usr/bin/horus
 
-
-# desinstalador standalone
 cat > "${WRAPPER_PURGE}" <<'PURGE'
 #!/usr/bin/env bash
 exec /usr/local/bin/horus uninstall
 PURGE
 chmod 755 "${WRAPPER_PURGE}"
 
-
-
 # ---------------------------
 # 10) Final
 # ---------------------------
-echo "==== Instalación completada ===="
+echo "==== Instalacion completada ===="
 echo " - Horus instalado en: ${HORUS_DIR}"
 echo " - Servicio systemd: horus.service"
 echo " - Wrapper: ${WRAPPER} (usa 'horus -h') y symlink /usr/bin/horus"
-echo " - Logs: ${LOG_DIR}/http_access.log, ${LOG_DIR}/ssh_access.log"
+echo " - Logs: ${LOG_DIR}/http_access.log, ${LOG_DIR}/http_wazuh.json, ${LOG_DIR}/ssh_access.log"
+echo
+echo "Para Wazuh Agent, agrega en /var/ossec/etc/ossec.conf:"
+echo "<localfile>"
+echo "  <location>${LOG_DIR}/http_wazuh.json</location>"
+echo "  <log_format>json</log_format>"
+echo "  <label key=\"@source\">horus</label>"
+echo "  <label key=\"integration\">horus-mitm</label>"
+echo "</localfile>"
 echo
 echo "Certificados para distribuir a los clientes VPN:"
 echo " - Windows (formato CER/DER): ${CERT_CER_DST}"
 echo " - Linux/macOS/Firefox (formato PEM): ${CERT_PEM_DST}"
 echo
-echo "Instala el CERT correspondiente como 'Autoridad de certificación raíz de confianza' y reinicia el navegador."
+echo "Instala el CERT correspondiente como 'Autoridad de certificacion raiz de confianza' y reinicia el navegador."
 systemctl status horus --no-pager -l || true
 journalctl -u horus -n 50 --no-pager -l || true
