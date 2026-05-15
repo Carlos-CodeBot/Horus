@@ -111,70 +111,165 @@ class SimpleLogger:
 addons = [ SimpleLogger() ]
 PYMITM
 
-# 5) Escribir ssh_log_watcher.py — inyectamos solamente la variable VPN_NET_PREFIX de forma segura
-# Primero escribimos la línea con el prefijo, luego concatenamos el resto literal.
+# 5) Escribir ssh_log_watcher.py — captura SSH local y conexiones SSH remotas que atraviesan la VPN
 printf 'VPN_NET_PREFIX = "%s"\n\n' "${VPN_NET_PREFIX}" > "${HORUS_DIR}/ssh_log_watcher.py"
 cat >> "${HORUS_DIR}/ssh_log_watcher.py" <<'PYSSH'
 # ssh_log_watcher.py
-# Lee journalctl -u sshd.service -f (o /var/log/auth.log) y extrae Accepted/Failed
-import re, subprocess, os, datetime, sys
+# Registra autenticaciones SSH locales y conexiones TCP/22 que atraviesan Horus por la VPN.
+import datetime
+import os
+import queue
+import re
+import subprocess
+import threading
 
 OUTFILE = "/opt/horus/ssh_access.log"
+REMOTE_PREFIX = "HORUS_SSH_REMOTE"
 
 os.makedirs(os.path.dirname(OUTFILE), exist_ok=True)
-open(OUTFILE, "a").close()
+LOGFH = open(OUTFILE, "a", buffering=1)
 
 RE_ACCEPT = re.compile(r"Accepted .* for (?P<user>\S+) from (?P<ip>\d+\.\d+\.\d+\.\d+)")
 RE_FAILED = re.compile(r"Failed .* for (invalid user )?(?P<user>\S+) from (?P<ip>\d+\.\d+\.\d+\.\d+)")
+RE_SRC = re.compile(r"\bSRC=(?P<src>\d+\.\d+\.\d+\.\d+)")
+RE_DST = re.compile(r"\bDST=(?P<dst>\d+\.\d+\.\d+\.\d+)")
+RE_SPT = re.compile(r"\bSPT=(?P<spt>\d+)")
+RE_DPT = re.compile(r"\bDPT=(?P<dpt>\d+)")
+RE_PROTO = re.compile(r"\bPROTO=(?P<proto>\S+)")
+
+event_queue = queue.Queue()
+seen_remote = set()
+
 
 def now():
     return datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-def parse_line(line):
-    m = RE_ACCEPT.search(line)
-    if m:
-        return (m.group("ip"), "ACCEPTED", m.group("user"), line.strip())
-    m2 = RE_FAILED.search(line)
-    if m2:
-        return (m2.group("ip"), "FAILED", m2.group("user"), line.strip())
-    return None
 
-def tail_journal():
-    return ["journalctl", "-u", "sshd.service", "-f", "-o", "short"]
+def write_event(line):
+    LOGFH.write(line + "\n")
 
-def tail_authlog():
-    return ["tail", "-F", "/var/log/auth.log"]
+
+def enqueue_stream(cmd, source_name):
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+    except Exception as exc:
+        write_event(f"{now()}\t-\tERROR\t-\tWATCHER\t{source_name}: {exc}")
+        return
+
+    try:
+        for raw in proc.stdout:
+            event_queue.put((source_name, raw.strip()))
+    except Exception as exc:
+        write_event(f"{now()}\t-\tERROR\t-\tWATCHER\t{source_name}: {exc}")
+    finally:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
+def start_local_ssh_stream():
+    try:
+        subprocess.run(
+            ["journalctl", "-u", "sshd.service", "--no-pager", "-n", "1"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+        cmd = ["journalctl", "-u", "sshd.service", "-f", "-o", "short"]
+    except Exception:
+        cmd = ["tail", "-F", "/var/log/auth.log"]
+
+    threading.Thread(target=enqueue_stream, args=(cmd, "local_ssh"), daemon=True).start()
+
+
+def start_remote_ssh_stream():
+    sources = [
+        ["journalctl", "-k", "-f", "-o", "short"],
+        ["tail", "-F", "/var/log/kern.log"],
+        ["tail", "-F", "/var/log/messages"],
+    ]
+
+    for cmd in sources:
+        try:
+            if cmd[0] == "journalctl":
+                probe = subprocess.run(["journalctl", "-k", "-n", "1", "--no-pager"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                probe = subprocess.run(["test", "-e", cmd[-1]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if probe.returncode == 0:
+                threading.Thread(target=enqueue_stream, args=(cmd, "remote_ssh"), daemon=True).start()
+                return
+        except Exception:
+            continue
+
+    write_event(f"{now()}\t-\tERROR\t-\tWATCHER\tNo se pudo abrir una fuente de logs kernel para REMOTE_SSH")
+
+
+def parse_local_ssh(line):
+    m = RE_ACCEPT.search(line) or RE_FAILED.search(line)
+    if not m:
+        return
+
+    ip = m.group("ip")
+    user = m.group("user")
+    if not ip.startswith(VPN_NET_PREFIX):
+        return
+
+    ev = "ACCEPTED" if "Accepted " in line else "FAILED"
+    write_event(f"{now()}\t{ip}\t{ev}\t{user}\tLOCAL_SSH\t-\t{line}")
+
+
+def parse_remote_ssh(line):
+    if REMOTE_PREFIX not in line:
+        return
+
+    src_m = RE_SRC.search(line)
+    dst_m = RE_DST.search(line)
+    spt_m = RE_SPT.search(line)
+    dpt_m = RE_DPT.search(line)
+    proto_m = RE_PROTO.search(line)
+
+    if not src_m or not dst_m or not dpt_m:
+        return
+
+    src = src_m.group("src")
+    dst = dst_m.group("dst")
+    spt = spt_m.group("spt") if spt_m else "-"
+    dpt = dpt_m.group("dpt")
+    proto = proto_m.group("proto") if proto_m else "TCP"
+
+    if dpt != "22":
+        return
+    if not src.startswith(VPN_NET_PREFIX):
+        return
+
+    dedup_key = f"{src}:{spt}>{dst}:{dpt}"
+    if dedup_key in seen_remote:
+        return
+    seen_remote.add(dedup_key)
+    if len(seen_remote) > 10000:
+        seen_remote.clear()
+
+    write_event(f"{now()}\t{src}\tCONNECT\t-\tREMOTE_SSH\t{dst}:{dpt}\tSPT={spt}\tPROTO={proto}\t{line}")
+
 
 def run_forever():
-    # elegir método
-    use_journal = False
-    try:
-        subprocess.run(["journalctl","-u","sshd.service","--no-pager","-n","1"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        use_journal = True
-    except Exception:
-        use_journal = False
+    start_local_ssh_stream()
+    start_remote_ssh_stream()
 
-    cmd = tail_journal() if use_journal else tail_authlog()
+    while True:
+        source, line = event_queue.get()
+        if source == "local_ssh":
+            parse_local_ssh(line)
+        elif source == "remote_ssh":
+            parse_remote_ssh(line)
 
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    try:
-        for raw in p.stdout:
-            parsed = parse_line(raw)
-            if not parsed:
-                continue
-            ip, ev, user, details = parsed
-            # filtrar por VPN_NET_PREFIX
-            if not ip.startswith(VPN_NET_PREFIX):
-                continue
-            line = f"{now()}\t{ip}\t{ev}\t{user}\t{details}\n"
-            with open(OUTFILE, "a") as f:
-                f.write(line)
-    except KeyboardInterrupt:
-        p.terminate()
-        return
-    except Exception:
-        p.terminate()
-        return
 
 if __name__ == "__main__":
     run_forever()
@@ -220,12 +315,61 @@ def check_root():
 
 def run_cmd(cmd):
     try:
-        # print command for debug
         print("CMD:", " ".join(cmd))
         return subprocess.check_call(cmd)
     except subprocess.CalledProcessError as e:
         print("Comando falló:", e)
         return e.returncode
+
+def nat_rule_exists(rule):
+    try:
+        subprocess.check_call(["iptables", "-t", "nat", "-C", "PREROUTING"] + rule, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+def filter_rule_exists(rule):
+    try:
+        subprocess.check_call(["iptables", "-C", "FORWARD"] + rule, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+def add_ssh_remote_logging():
+    rule = [
+        "-i", IF_IN,
+        "-s", VPN_NET,
+        "-p", "tcp",
+        "--dport", "22",
+        "-m", "conntrack",
+        "--ctstate", "NEW",
+        "-j", "LOG",
+        "--log-prefix", "HORUS_SSH_REMOTE ",
+        "--log-level", "4",
+    ]
+    try:
+        if not filter_rule_exists(rule):
+            run_cmd(["iptables", "-I", "FORWARD", "1"] + rule)
+    except Exception as e:
+        print("Error agregando regla SSH remoto:", e)
+
+def del_ssh_remote_logging():
+    rule = [
+        "-i", IF_IN,
+        "-s", VPN_NET,
+        "-p", "tcp",
+        "--dport", "22",
+        "-m", "conntrack",
+        "--ctstate", "NEW",
+        "-j", "LOG",
+        "--log-prefix", "HORUS_SSH_REMOTE ",
+        "--log-level", "4",
+    ]
+    try:
+        while filter_rule_exists(rule):
+            run_cmd(["iptables", "-D", "FORWARD"] + rule)
+    except Exception as e:
+        print("Error borrando regla SSH remoto:", e)
 
 def add_iptables():
     try:
@@ -236,49 +380,41 @@ def add_iptables():
         run_cmd(["iptables","-t","nat","-A","PREROUTING","-i",IF_IN,"-s",VPN_NET,"-p","tcp","--dport","443","-j","REDIRECT","--to-ports",str(MITM_PORT)])
     except Exception:
         pass
+    add_ssh_remote_logging()
     try:
         run_cmd(["sysctl","-w","net.ipv4.ip_forward=1"])
     except Exception:
         pass
 
-def rule_exists(rule):
-    try:
-        cmd = ["iptables","-t","nat","-C","PREROUTING"] + rule
-        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return True
-    except subprocess.CalledProcessError:
-        return False
-    except FileNotFoundError:
-        return False
-
 def del_iptables():
+    del_ssh_remote_logging()
     rule1 = ["-i", IF_IN, "-s", VPN_NET, "-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-ports", str(MITM_PORT)]
     rule2 = ["-i", IF_IN, "-s", VPN_NET, "-p", "tcp", "--dport", "443", "-j", "REDIRECT", "--to-ports", str(MITM_PORT)]
     try:
-        if rule_exists(rule1):
+        if nat_rule_exists(rule1):
             run_cmd(["iptables","-t","nat","-D","PREROUTING"] + rule1)
     except Exception as e:
         print("Error borrando regla 80:", e)
     try:
-        if rule_exists(rule2):
+        if nat_rule_exists(rule2):
             run_cmd(["iptables","-t","nat","-D","PREROUTING"] + rule2)
     except Exception as e:
         print("Error borrando regla 443:", e)
 
 # start mitmdump: try entrypoint, fallback to python -m
 def start_mitmdump():
-    # prefer entrypoint mitmdump if exists
     if os.path.exists(MITMDUMP_BIN):
         return subprocess.Popen([MITMDUMP_BIN, "--mode", "transparent", "--listen-port", str(MITM_PORT), "-s", MITM_ADDON])
-    # else try mitmproxy module (dump) with python from venv
     py = sys.executable
     try:
         return subprocess.Popen([py, "-m", "mitmproxy.tools.dump", "--mode", "transparent", "--listen-port", str(MITM_PORT), "-s", MITM_ADDON])
     except Exception:
-        # last fallback: generic mitmdump name on PATH
         return subprocess.Popen(["mitmdump", "--mode", "transparent", "--listen-port", str(MITM_PORT), "-s", MITM_ADDON])
 
 def start_ssh_watcher():
+    vpy = os.path.join(os.path.dirname(MITMDUMP_BIN), "python")
+    if os.path.exists(vpy):
+        return subprocess.Popen([vpy, SSH_WATCHER])
     return subprocess.Popen(["python3", SSH_WATCHER])
 
 def main():
@@ -307,7 +443,6 @@ def main():
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    # ensure logs exist
     open(HTTP_LOG, "a").close()
     open(SSH_LOG, "a").close()
 
@@ -316,9 +451,14 @@ def main():
             if mitm_proc.poll() is not None:
                 print("mitmdump terminó con código", mitm_proc.returncode)
                 break
+            if ssh_proc.poll() is not None:
+                print("ssh watcher terminó con código", ssh_proc.returncode)
+                break
             time.sleep(1)
     except KeyboardInterrupt:
         shutdown(None, None)
+    finally:
+        del_iptables()
 
 if __name__ == "__main__":
     main()
@@ -340,7 +480,6 @@ if [ -x "${MITM_ENTRY}" ]; then
   "${MITM_ENTRY}" --quiet --listen-port 0 -s /dev/null >/dev/null 2>&1 &
   MPID=$!
 else
-  # usar python -m mitmproxy.tools.dump directamente
   "${MITMPROXY_PY}" -m mitmproxy.tools.dump --quiet --listen-port 0 -s /dev/null >/dev/null 2>&1 &
   MPID=$!
 fi
